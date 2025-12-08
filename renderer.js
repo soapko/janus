@@ -16,7 +16,7 @@ function createBrowserTab(url = 'http://localhost:3000') {
   webview.className = 'browser-instance';
   webview.id = `browser-${id}`;
   webview.setAttribute('allowpopups', '');
-  webview.setAttribute('webpreferences', 'contextIsolation=yes, nodeIntegration=no, javascript=yes, webgl=yes, enableBlinkFeatures=PreciseMemoryInfo');
+  webview.setAttribute('webpreferences', 'contextIsolation=yes, nodeIntegration=no, javascript=yes, webgl=yes');
   webview.setAttribute('partition', 'persist:browser');
   webview.setAttribute('useragent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
   webview.src = url;
@@ -79,6 +79,18 @@ function createBrowserTab(url = 'http://localhost:3000') {
   webview.addEventListener('render-process-gone', (e) => {
     console.error('=== RENDER PROCESS GONE ===');
     console.error('Reason:', e.reason);
+
+    // Auto-reload disabled for debugging
+    // if (e.reason !== 'killed' && e.reason !== 'clean-exit') {
+    //   console.log('Attempting to reload webview...');
+    //   setTimeout(() => {
+    //     try {
+    //       webview.reload();
+    //     } catch (err) {
+    //       console.error('Failed to reload:', err);
+    //     }
+    //   }, 1000);
+    // }
   });
 
   webview.addEventListener('destroyed', () => {
@@ -295,13 +307,37 @@ const tabBar = document.getElementById('tab-bar');
 const terminalsContainer = document.getElementById('terminals-container');
 const newTabBtn = document.getElementById('new-tab-btn');
 
+// Terminal zoom state
+let terminalFontSize = 14;
+const MIN_FONT_SIZE = 8;
+const MAX_FONT_SIZE = 32;
+
+function setTerminalFontSize(size) {
+  terminalFontSize = Math.max(MIN_FONT_SIZE, Math.min(MAX_FONT_SIZE, size));
+
+  // Update all terminal instances
+  for (const [id, termInfo] of terminals) {
+    termInfo.term.options.fontSize = terminalFontSize;
+    termInfo.fitAddon.fit();
+    window.electronAPI.resizeTerminal(id, termInfo.term.cols, termInfo.term.rows);
+  }
+}
+
+function zoomInTerminal() {
+  setTerminalFontSize(terminalFontSize + 2);
+}
+
+function zoomOutTerminal() {
+  setTerminalFontSize(terminalFontSize - 2);
+}
+
 async function createTab() {
   const id = await window.electronAPI.createTerminal();
 
-  // Create terminal instance
+  // Create terminal instance with current font size
   const term = new Terminal({
     cursorBlink: true,
-    fontSize: 14,
+    fontSize: terminalFontSize,
     fontFamily: 'Menlo, Monaco, monospace',
     theme: {
       background: '#000000',
@@ -432,6 +468,10 @@ window.electronAPI.onTerminalData((id, data) => {
 
 // New tab button
 newTabBtn.addEventListener('click', createTab);
+
+// Zoom buttons
+document.getElementById('zoom-in-btn').addEventListener('click', zoomInTerminal);
+document.getElementById('zoom-out-btn').addEventListener('click', zoomOutTerminal);
 
 // Initial tab will be created after project folder selection (see initProjectFolder)
 
@@ -835,5 +875,15 @@ document.addEventListener('keydown', (e) => {
     if (browser) {
       browser.reload();
     }
+  }
+
+  // Terminal zoom shortcuts (Cmd/Ctrl + and Cmd/Ctrl -)
+  if ((e.metaKey || e.ctrlKey) && (e.key === '=' || e.key === '+')) {
+    e.preventDefault();
+    zoomInTerminal();
+  }
+  if ((e.metaKey || e.ctrlKey) && e.key === '-') {
+    e.preventDefault();
+    zoomOutTerminal();
   }
 });
