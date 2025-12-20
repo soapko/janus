@@ -1,3 +1,66 @@
+// ===== PANE SELECTION STATE =====
+let selectedPane = 'terminal'; // 'browser' or 'terminal'
+
+function selectPane(pane) {
+  selectedPane = pane;
+  // Update visual indicator
+  document.getElementById('browser-panel').classList.toggle('selected', pane === 'browser');
+  document.getElementById('terminal-panel').classList.toggle('selected', pane === 'terminal');
+}
+
+// ===== BROWSER PANEL TOGGLE =====
+let browserPanelCollapsed = false;
+
+function toggleBrowserPanel() {
+  browserPanelCollapsed = !browserPanelCollapsed;
+
+  const browserPanel = document.getElementById('browser-panel');
+  const divider = document.getElementById('divider');
+  const toggleBtn = document.getElementById('toggle-browser-btn');
+
+  if (browserPanelCollapsed) {
+    browserPanel.classList.add('collapsed');
+    divider.classList.add('collapsed');
+    toggleBtn.textContent = '▶';
+    toggleBtn.title = 'Show Browser (Cmd+\\)';
+    // Select terminal pane when browser is hidden
+    selectPane('terminal');
+  } else {
+    browserPanel.classList.remove('collapsed');
+    divider.classList.remove('collapsed');
+    toggleBtn.textContent = '◀';
+    toggleBtn.title = 'Hide Browser (Cmd+\\)';
+  }
+
+  // Resize terminal after panel toggle
+  setTimeout(resizeActiveTerminal, 50);
+}
+
+// ===== TITLE BAR MANAGEMENT =====
+const titleBar = document.getElementById('title-bar');
+const titleBarText = document.getElementById('title-bar-text');
+
+function updateTitleBar(color, title) {
+  if (titleBar && color) {
+    titleBar.style.background = color;
+  }
+  if (titleBarText && title) {
+    titleBarText.textContent = title;
+  }
+}
+
+// Initialize title bar on load
+window.electronAPI.getTitleBarInfo().then(info => {
+  if (info) {
+    updateTitleBar(info.color, info.title);
+  }
+});
+
+// Listen for title bar updates from main process
+window.electronAPI.onTitleBarUpdate((data) => {
+  updateTitleBar(data.color, data.title);
+});
+
 // ===== BROWSER TAB MANAGEMENT =====
 const browsers = new Map();
 let activeBrowserId = null;
@@ -155,6 +218,9 @@ function switchToBrowserTab(id) {
     } catch (e) {
       urlInput.value = browserInfo.webview.src || '';
     }
+
+    // Select browser pane
+    selectPane('browser');
   }
 }
 
@@ -282,10 +348,25 @@ dropOverlay.addEventListener('drop', (e) => {
     // Use the file path from Electron's file object
     const filePath = file.path;
     if (filePath) {
-      const fileUrl = 'file://' + filePath;
-      urlInput.value = fileUrl;
-      const browser = getActiveBrowser();
-      if (browser) browser.src = fileUrl;
+      // Check if drop is over the terminal panel
+      const terminalPanel = document.getElementById('terminal-panel');
+      const terminalRect = terminalPanel.getBoundingClientRect();
+      const isOverTerminal = e.clientX >= terminalRect.left &&
+                             e.clientX <= terminalRect.right &&
+                             e.clientY >= terminalRect.top &&
+                             e.clientY <= terminalRect.bottom;
+
+      if (isOverTerminal && activeTerminalId) {
+        // Insert file path into active terminal (escape spaces and special chars)
+        const escapedPath = filePath.replace(/([ "'\\$`!])/g, '\\$1');
+        window.electronAPI.sendTerminalInput(activeTerminalId, escapedPath);
+      } else {
+        // Navigate browser to file
+        const fileUrl = 'file://' + filePath;
+        urlInput.value = fileUrl;
+        const browser = getActiveBrowser();
+        if (browser) browser.src = fileUrl;
+      }
     }
   }
 });
@@ -417,6 +498,9 @@ function switchToTab(id) {
       termInfo.term.focus();
       window.electronAPI.resizeTerminal(id, termInfo.term.cols, termInfo.term.rows);
     }, 50);
+
+    // Select terminal pane
+    selectPane('terminal');
   }
 }
 
@@ -472,6 +556,9 @@ newTabBtn.addEventListener('click', createTab);
 // Zoom buttons
 document.getElementById('zoom-in-btn').addEventListener('click', zoomInTerminal);
 document.getElementById('zoom-out-btn').addEventListener('click', zoomOutTerminal);
+
+// Browser panel toggle button
+document.getElementById('toggle-browser-btn').addEventListener('click', toggleBrowserPanel);
 
 // Initial tab will be created after project folder selection (see initProjectFolder)
 
@@ -885,5 +972,43 @@ document.addEventListener('keydown', (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key === '-') {
     e.preventDefault();
     zoomOutTerminal();
+  }
+
+  // Toggle browser panel (Cmd/Ctrl + \)
+  if ((e.metaKey || e.ctrlKey) && e.key === '\\') {
+    e.preventDefault();
+    toggleBrowserPanel();
+  }
+});
+
+
+// ===== PANE SELECTION CLICK HANDLERS =====
+document.getElementById('browser-panel').addEventListener('click', (e) => {
+  // Don't select browser pane if clicking on divider resize handle
+  if (!e.target.closest('#divider')) {
+    selectPane('browser');
+  }
+});
+
+document.getElementById('terminal-panel').addEventListener('click', () => {
+  selectPane('terminal');
+});
+
+// Also select terminal pane when terminal receives focus (keyboard navigation)
+terminalsContainer.addEventListener('focusin', () => {
+  selectPane('terminal');
+});
+
+
+// ===== CLOSE TAB HANDLER =====
+window.electronAPI.onCloseTab(() => {
+  if (selectedPane === 'browser') {
+    if (activeBrowserId) {
+      closeBrowserTab(activeBrowserId);
+    }
+  } else {
+    if (activeTerminalId) {
+      closeTab(activeTerminalId);
+    }
   }
 });

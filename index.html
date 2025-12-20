@@ -24,6 +24,31 @@
       font-family: -apple-system, BlinkMacSystemFont, sans-serif;
     }
 
+    .title-bar {
+      height: 40px;
+      background: #475569;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      -webkit-app-region: drag;
+      flex-shrink: 0;
+      position: relative;
+    }
+
+    .title-bar-text {
+      font-size: 13px;
+      font-weight: 500;
+      color: rgba(255, 255, 255, 0.9);
+      -webkit-app-region: no-drag;
+      pointer-events: none;
+    }
+
+    .title-bar-spacer {
+      position: absolute;
+      left: 0;
+      width: 80px; /* Space for traffic lights */
+    }
+
     .toolbar {
       display: flex;
       align-items: center;
@@ -73,6 +98,19 @@
       flex-direction: column;
       min-width: 200px;
       min-height: 0; /* Important for nested flex containers */
+      border-top: 2px solid transparent;
+    }
+
+    .panel.selected {
+      border-top-color: #0066cc;
+    }
+
+    .panel.collapsed {
+      display: none;
+    }
+
+    .divider.collapsed {
+      display: none;
     }
 
     .divider {
@@ -324,6 +362,10 @@
   </style>
 </head>
 <body>
+  <div class="title-bar" id="title-bar">
+    <div class="title-bar-spacer"></div>
+    <span class="title-bar-text" id="title-bar-text">Janus</span>
+  </div>
   <div class="container">
     <div class="panel" id="browser-panel">
       <div class="toolbar">
@@ -348,6 +390,7 @@
       <div class="panel-toolbar">
         <span class="panel-title">Terminal</span>
         <div class="zoom-controls">
+          <button class="zoom-btn" id="toggle-browser-btn" title="Hide Browser (Cmd+\)">◀</button>
           <button class="zoom-btn" id="zoom-out-btn" title="Zoom Out (Cmd/Ctrl -)">−</button>
           <button class="zoom-btn" id="zoom-in-btn" title="Zoom In (Cmd/Ctrl +)">+</button>
         </div>
