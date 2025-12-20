@@ -9,7 +9,7 @@ function selectPane(pane) {
 }
 
 // ===== BROWSER PANEL TOGGLE =====
-let browserPanelCollapsed = false;
+let browserPanelCollapsed = true; // Start collapsed (terminal maximized)
 
 function toggleBrowserPanel() {
   browserPanelCollapsed = !browserPanelCollapsed;
@@ -35,6 +35,19 @@ function toggleBrowserPanel() {
   // Resize terminal after panel toggle
   setTimeout(resizeActiveTerminal, 50);
 }
+
+// Initialize browser panel state on load
+function initBrowserPanelState() {
+  if (browserPanelCollapsed) {
+    document.getElementById('browser-panel').classList.add('collapsed');
+    document.getElementById('divider').classList.add('collapsed');
+    document.getElementById('toggle-browser-btn').textContent = '▶';
+    document.getElementById('toggle-browser-btn').title = 'Show Browser (Cmd+\\)';
+  }
+}
+
+// Run after DOM is ready
+initBrowserPanelState();
 
 // ===== TITLE BAR MANAGEMENT =====
 const titleBar = document.getElementById('title-bar');
