@@ -476,6 +476,21 @@ async function createTab() {
     window.electronAPI.sendTerminalInput(id, data);
   });
 
+  // Track scroll position for scroll-to-bottom button
+  term.onScroll(() => {
+    if (id === activeTerminalId) {
+      updateScrollButtonVisibility();
+    }
+  });
+
+  // Also listen for wheel events on the container for more reliable scroll detection
+  container.addEventListener('wheel', () => {
+    if (id === activeTerminalId) {
+      // Small delay to let xterm process the scroll first
+      setTimeout(updateScrollButtonVisibility, 10);
+    }
+  }, { passive: true });
+
   // Store terminal info
   terminals.set(id, { term, fitAddon, container, tab });
 
@@ -486,6 +501,16 @@ async function createTab() {
   setTimeout(() => {
     fitAddon.fit();
     window.electronAPI.resizeTerminal(id, term.cols, term.rows);
+
+    // Listen to scroll events on the xterm viewport element directly
+    const viewport = container.querySelector('.xterm-viewport');
+    if (viewport) {
+      viewport.addEventListener('scroll', () => {
+        if (id === activeTerminalId) {
+          updateScrollButtonVisibility();
+        }
+      }, { passive: true });
+    }
   }, 100);
 
   return id;
@@ -510,6 +535,8 @@ function switchToTab(id) {
       termInfo.fitAddon.fit();
       termInfo.term.focus();
       window.electronAPI.resizeTerminal(id, termInfo.term.cols, termInfo.term.rows);
+      // Update scroll button for new active terminal
+      updateScrollButtonVisibility();
     }, 50);
 
     // Select terminal pane
@@ -560,11 +587,59 @@ window.electronAPI.onTerminalData((id, data) => {
   const termInfo = terminals.get(id);
   if (termInfo) {
     termInfo.term.write(data);
+    // Update scroll button after data is written (buffer state may have changed)
+    if (id === activeTerminalId) {
+      setTimeout(updateScrollButtonVisibility, 0);
+    }
   }
 });
 
 // New tab button
 newTabBtn.addEventListener('click', createTab);
+
+// ===== SCROLL TO BOTTOM BUTTON =====
+const scrollToBottomBtn = document.getElementById('scroll-to-bottom-btn');
+
+function updateScrollButtonVisibility() {
+  if (!activeTerminalId) {
+    scrollToBottomBtn.classList.remove('visible');
+    return;
+  }
+
+  const termInfo = terminals.get(activeTerminalId);
+  if (!termInfo) {
+    scrollToBottomBtn.classList.remove('visible');
+    return;
+  }
+
+  const term = termInfo.term;
+  const buffer = term.buffer.active;
+  // baseY is the line at the top of the scrollback buffer that's currently visible
+  // viewportY is where the viewport starts
+  // If viewportY < baseY, user has scrolled up
+  const isAtBottom = buffer.viewportY >= buffer.baseY;
+
+  if (isAtBottom) {
+    scrollToBottomBtn.classList.remove('visible');
+  } else {
+    scrollToBottomBtn.classList.add('visible');
+  }
+}
+
+function scrollTerminalToBottom() {
+  if (!activeTerminalId) return;
+
+  const termInfo = terminals.get(activeTerminalId);
+  if (!termInfo) return;
+
+  termInfo.term.scrollToBottom();
+  scrollToBottomBtn.classList.remove('visible');
+}
+
+scrollToBottomBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  scrollTerminalToBottom();
+});
 
 // Zoom buttons
 document.getElementById('zoom-in-btn').addEventListener('click', zoomInTerminal);
