@@ -33,7 +33,7 @@ function toggleBrowserPanel() {
   }
 
   // Resize terminal after panel toggle
-  setTimeout(resizeActiveTerminal, 50);
+  setTimeout(debouncedResizeActiveTerminal, 50);
 }
 
 // Initialize browser panel state on load
@@ -412,8 +412,7 @@ function setTerminalFontSize(size) {
   // Update all terminal instances
   for (const [id, termInfo] of terminals) {
     termInfo.term.options.fontSize = terminalFontSize;
-    termInfo.fitAddon.fit();
-    window.electronAPI.resizeTerminal(id, termInfo.term.cols, termInfo.term.rows);
+    fitTerminal(termInfo, id);
   }
 }
 
@@ -477,19 +476,12 @@ async function createTab() {
   });
 
   // Track scroll position for scroll-to-bottom button
+  // Use only term.onScroll - it fires for all scroll changes including wheel events
   term.onScroll(() => {
     if (id === activeTerminalId) {
       updateScrollButtonVisibility();
     }
   });
-
-  // Also listen for wheel events on the container for more reliable scroll detection
-  container.addEventListener('wheel', () => {
-    if (id === activeTerminalId) {
-      // Small delay to let xterm process the scroll first
-      setTimeout(updateScrollButtonVisibility, 10);
-    }
-  }, { passive: true });
 
   // Store terminal info
   terminals.set(id, { term, fitAddon, container, tab });
@@ -499,18 +491,7 @@ async function createTab() {
 
   // Fit after a short delay
   setTimeout(() => {
-    fitAddon.fit();
-    window.electronAPI.resizeTerminal(id, term.cols, term.rows);
-
-    // Listen to scroll events on the xterm viewport element directly
-    const viewport = container.querySelector('.xterm-viewport');
-    if (viewport) {
-      viewport.addEventListener('scroll', () => {
-        if (id === activeTerminalId) {
-          updateScrollButtonVisibility();
-        }
-      }, { passive: true });
-    }
+    fitTerminal(terminals.get(id), id);
   }, 100);
 
   return id;
@@ -532,9 +513,8 @@ function switchToTab(id) {
 
     // Fit and focus
     setTimeout(() => {
-      termInfo.fitAddon.fit();
+      fitTerminal(termInfo, id);
       termInfo.term.focus();
-      window.electronAPI.resizeTerminal(id, termInfo.term.cols, termInfo.term.rows);
       // Update scroll button for new active terminal
       updateScrollButtonVisibility();
     }, 50);
@@ -568,19 +548,47 @@ function closeTab(id) {
   }
 }
 
+// Fit a terminal while preserving scroll position.
+// xterm.js can shift the viewport during reflow, causing the terminal to
+// flash between top and bottom when there is a large scrollback buffer.
+function fitTerminal(termInfo, id) {
+  const buffer = termInfo.term.buffer.active;
+  const wasAtBottom = buffer.viewportY >= buffer.baseY;
+
+  termInfo.fitAddon.fit();
+
+  // After fit/reflow, restore scroll position if user was at the bottom
+  if (wasAtBottom) {
+    termInfo.term.scrollToBottom();
+  }
+
+  window.electronAPI.resizeTerminal(id, termInfo.term.cols, termInfo.term.rows);
+}
+
 // Handle resize for active terminal
 function resizeActiveTerminal() {
   if (activeTerminalId) {
     const termInfo = terminals.get(activeTerminalId);
     if (termInfo) {
-      termInfo.fitAddon.fit();
-      window.electronAPI.resizeTerminal(activeTerminalId, termInfo.term.cols, termInfo.term.rows);
+      fitTerminal(termInfo, activeTerminalId);
     }
   }
 }
 
-window.addEventListener('resize', resizeActiveTerminal);
-new ResizeObserver(resizeActiveTerminal).observe(terminalsContainer);
+// Debounced resize to prevent feedback loops from ResizeObserver/window resize.
+// fit() can trigger re-renders that re-fire the observer; batching into a
+// single animation frame breaks the cycle.
+let resizeRAF = null;
+function debouncedResizeActiveTerminal() {
+  if (resizeRAF) cancelAnimationFrame(resizeRAF);
+  resizeRAF = requestAnimationFrame(() => {
+    resizeRAF = null;
+    resizeActiveTerminal();
+  });
+}
+
+window.addEventListener('resize', debouncedResizeActiveTerminal);
+new ResizeObserver(debouncedResizeActiveTerminal).observe(terminalsContainer);
 
 // Handle terminal data from main process
 window.electronAPI.onTerminalData((id, data) => {
@@ -600,7 +608,33 @@ newTabBtn.addEventListener('click', createTab);
 // ===== SCROLL TO BOTTOM BUTTON =====
 const scrollToBottomBtn = document.getElementById('scroll-to-bottom-btn');
 
+// Debounce scroll button visibility updates to prevent rapid flipping
+let scrollUpdateTimer = null;
+let lastScrollUpdateTime = 0;
+const SCROLL_UPDATE_DEBOUNCE = 50; // ms
+
 function updateScrollButtonVisibility() {
+  // Debounce: cancel any pending update and schedule a new one
+  if (scrollUpdateTimer) {
+    clearTimeout(scrollUpdateTimer);
+  }
+
+  // Throttle: if we just updated, schedule for later
+  const now = Date.now();
+  const timeSinceLastUpdate = now - lastScrollUpdateTime;
+
+  if (timeSinceLastUpdate < SCROLL_UPDATE_DEBOUNCE) {
+    scrollUpdateTimer = setTimeout(doScrollButtonUpdate, SCROLL_UPDATE_DEBOUNCE - timeSinceLastUpdate);
+    return;
+  }
+
+  doScrollButtonUpdate();
+}
+
+function doScrollButtonUpdate() {
+  scrollUpdateTimer = null;
+  lastScrollUpdateTime = Date.now();
+
   if (!activeTerminalId) {
     scrollToBottomBtn.classList.remove('visible');
     return;
@@ -678,7 +712,7 @@ document.addEventListener('mousemove', (e) => {
   if (percentage > 20 && percentage < 80) {
     leftPanel.style.flex = `0 0 ${percentage}%`;
     rightPanel.style.flex = `0 0 ${100 - percentage}%`;
-    resizeActiveTerminal();
+    debouncedResizeActiveTerminal();
   }
 });
 
