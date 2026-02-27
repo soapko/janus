@@ -6,15 +6,31 @@
   "author": "Karl",
   "license": "MIT",
   "scripts": {
-    "start": "electron-forge start",
-    "package": "electron-forge package",
-    "make": "electron-forge make",
+    "start": "npm run build:chat && electron-forge start",
+    "build:chat": "esbuild src/cumulus/index.tsx --bundle --outfile=dist/cumulus-chat.js --platform=browser --target=chrome120 --loader:.css=css --define:process.env.NODE_ENV='\"production\"'",
+    "watch:chat": "esbuild src/cumulus/index.tsx --bundle --outfile=dist/cumulus-chat.js --platform=browser --target=chrome120 --loader:.css=css --watch",
+    "prepackage": "node scripts/resolve-cumulus-symlink.js",
+    "package": "npm run build:chat && npm run prepackage && electron-forge package",
+    "postpackage": "node scripts/restore-cumulus-symlink.js",
+    "make": "npm run build:chat && electron-forge make",
     "rebuild": "electron-rebuild -f -w node-pty",
     "test:browser": "node test-browser.js"
   },
   "dependencies": {
+    "@huggingface/transformers": "^3.8.1",
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "commander": "^14.0.3",
+    "cumulus": "file:../cumulus",
     "electron-squirrel-startup": "^1.0.1",
+    "ink": "^6.8.0",
+    "ink-spinner": "^5.0.0",
+    "ink-text-input": "^6.0.0",
+    "nanoid": "^5.1.6",
     "node-pty": "^1.0.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "react-markdown": "^10.1.0",
+    "rehype-highlight": "^7.0.2",
     "xterm": "^5.3.0",
     "xterm-addon-fit": "^0.8.0"
   },
@@ -28,8 +44,14 @@
     "@electron-forge/plugin-auto-unpack-natives": "^7.10.2",
     "@electron-forge/plugin-fuses": "^7.10.2",
     "@electron/fuses": "^1.8.0",
+    "@electron/osx-sign": "^2.3.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "appdmg": "^0.6.6",
     "electron": "^28.0.0",
     "electron-rebuild": "^3.2.9",
-    "playwright": "^1.56.1"
+    "esbuild": "^0.27.3",
+    "playwright": "^1.56.1",
+    "typescript": "^5.9.3"
   }
 }

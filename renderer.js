@@ -1,58 +1,48 @@
-// ===== PANE SELECTION STATE =====
-let selectedPane = 'terminal'; // 'browser' or 'terminal'
+// ===== STATE =====
+const tabs = new Map();        // tabId -> Tab
+const ptyToTabId = new Map();  // ptyId -> tabId
 
-function selectPane(pane) {
-  selectedPane = pane;
-  // Update visual indicator
-  document.getElementById('browser-panel').classList.toggle('selected', pane === 'browser');
-  document.getElementById('terminal-panel').classList.toggle('selected', pane === 'terminal');
-}
+let activeTabId = null;
+let nextTabId = 1;
 
-// ===== BROWSER PANEL TOGGLE =====
-let browserPanelCollapsed = true; // Start collapsed (terminal maximized)
+// Terminal zoom state (global across all terminals)
+let terminalFontSize = 14;
+const MIN_FONT_SIZE = 8;
+const MAX_FONT_SIZE = 32;
 
-function toggleBrowserPanel() {
-  browserPanelCollapsed = !browserPanelCollapsed;
+// Map to track element UUIDs and their terminal tabs (for feedback mode)
+// key: elementKey string -> { tabId, uuid }
+const elementTerminals = new Map();
 
-  const browserPanel = document.getElementById('browser-panel');
-  const divider = document.getElementById('divider');
-  const toggleBtn = document.getElementById('toggle-browser-btn');
+// Batched terminal writes: ptyId -> accumulated string
+const pendingWrites = new Map();
+let writeFlushRAF = null;
 
-  if (browserPanelCollapsed) {
-    browserPanel.classList.add('collapsed');
-    divider.classList.add('collapsed');
-    toggleBtn.textContent = '▶';
-    toggleBtn.title = 'Show Browser (Cmd+\\)';
-    // Select terminal pane when browser is hidden
-    selectPane('terminal');
-  } else {
-    browserPanel.classList.remove('collapsed');
-    divider.classList.remove('collapsed');
-    toggleBtn.textContent = '◀';
-    toggleBtn.title = 'Hide Browser (Cmd+\\)';
-  }
+// Per-terminal follow-bottom: ptyId -> bool
+const terminalFollowBottom = new Map();
 
-  // Resize terminal after panel toggle
-  setTimeout(debouncedResizeActiveTerminal, 50);
-}
+// Resize handle drag state
+let resizeDragState = null;
 
-// Initialize browser panel state on load
-function initBrowserPanelState() {
-  if (browserPanelCollapsed) {
-    document.getElementById('browser-panel').classList.add('collapsed');
-    document.getElementById('divider').classList.add('collapsed');
-    document.getElementById('toggle-browser-btn').textContent = '▶';
-    document.getElementById('toggle-browser-btn').title = 'Show Browser (Cmd+\\)';
-  }
-}
+// Feedback state
+let feedbackMode = false;
+let selectedElementData = null;
 
-// Run after DOM is ready
-initBrowserPanelState();
 
-// ===== TITLE BAR MANAGEMENT =====
+// ===== DOM REFERENCES =====
+const tabBar = document.getElementById('tab-bar');
+const newTabBtn = document.getElementById('new-tab-btn');
+const tabTypePicker = document.getElementById('tab-type-picker');
+const panelsContainer = document.getElementById('panels-container');
+const dropOverlay = document.getElementById('drop-overlay');
+const feedbackPopup = document.getElementById('feedback-popup');
+const feedbackText = document.getElementById('feedback-text');
+const feedbackSubmit = document.getElementById('feedback-submit');
 const titleBar = document.getElementById('title-bar');
 const titleBarText = document.getElementById('title-bar-text');
 
+
+// ===== TITLE BAR =====
 function updateTitleBar(color, title) {
   if (titleBar && color) {
     titleBar.style.background = color;
@@ -62,372 +52,302 @@ function updateTitleBar(color, title) {
   }
 }
 
-// Initialize title bar on load
 window.electronAPI.getTitleBarInfo().then(info => {
   if (info) {
     updateTitleBar(info.color, info.title);
   }
 });
 
-// Listen for title bar updates from main process
 window.electronAPI.onTitleBarUpdate((data) => {
   updateTitleBar(data.color, data.title);
 });
 
-// ===== BROWSER TAB MANAGEMENT =====
-const browsers = new Map();
-let activeBrowserId = null;
-let nextBrowserId = 1;
 
-const browserTabBar = document.getElementById('browser-tab-bar');
-const browsersContainer = document.getElementById('browsers-container');
-const newBrowserTabBtn = document.getElementById('new-browser-tab-btn');
-const urlInput = document.getElementById('url-input');
+// ===== TAB ELEMENT BUILDER =====
+function buildTabEl(tab) {
+  const el = document.createElement('div');
+  el.className = 'tab';
+  el.dataset.tabId = tab.id;
 
-function createBrowserTab(url = 'http://localhost:3000') {
-  const id = nextBrowserId++;
+  const dot = document.createElement('span');
+  dot.className = `tab-type-dot ${tab.type}`;
 
-  // Create webview
+  const titleSpan = document.createElement('span');
+  titleSpan.className = 'tab-title';
+  titleSpan.textContent = tab.label;
+
+  const closeSpan = document.createElement('span');
+  closeSpan.className = 'tab-close';
+  closeSpan.textContent = '×';
+
+  el.appendChild(dot);
+  el.appendChild(titleSpan);
+  el.appendChild(closeSpan);
+
+  el.addEventListener('click', (e) => {
+    if (e.target === closeSpan) {
+      closeTab(tab.id);
+      return;
+    }
+    if (e.metaKey || e.ctrlKey) {
+      toggleTabVisibility(tab.id);
+    } else {
+      soloSelectTab(tab.id);
+    }
+  });
+
+  return el;
+}
+
+
+// ===== WEB TAB =====
+function createWebTab(url = 'http://localhost:3000') {
+  const id = nextTabId++;
+
+  // Build panel
+  const panelEl = document.createElement('div');
+  panelEl.className = 'tab-panel';
+  panelEl.dataset.tabId = id;
+
+  // Toolbar
+  const toolbar = document.createElement('div');
+  toolbar.className = 'web-toolbar';
+
+  const backBtn = document.createElement('button');
+  backBtn.className = 'nav-btn';
+  backBtn.textContent = '←';
+  backBtn.title = 'Back';
+
+  const forwardBtn = document.createElement('button');
+  forwardBtn.className = 'nav-btn';
+  forwardBtn.textContent = '→';
+  forwardBtn.title = 'Forward';
+
+  const reloadBtn = document.createElement('button');
+  reloadBtn.className = 'nav-btn';
+  reloadBtn.textContent = '↻';
+  reloadBtn.title = 'Reload';
+
+  const feedbackBtn = document.createElement('button');
+  feedbackBtn.className = 'nav-btn';
+  feedbackBtn.textContent = '⊙';
+  feedbackBtn.title = 'Feedback';
+
+  const urlInput = document.createElement('input');
+  urlInput.type = 'text';
+  urlInput.className = 'url-input';
+  urlInput.placeholder = 'Enter URL...';
+  urlInput.value = url;
+
+  const goBtn = document.createElement('button');
+  goBtn.className = 'nav-btn';
+  goBtn.textContent = 'Go';
+
+  toolbar.appendChild(backBtn);
+  toolbar.appendChild(forwardBtn);
+  toolbar.appendChild(reloadBtn);
+  toolbar.appendChild(feedbackBtn);
+  toolbar.appendChild(urlInput);
+  toolbar.appendChild(goBtn);
+
+  // Web container (holds the webview)
+  const webContainer = document.createElement('div');
+  webContainer.className = 'web-container';
+
+  // Webview — NEVER moved in DOM after creation
   const webview = document.createElement('webview');
-  webview.className = 'browser-instance';
-  webview.id = `browser-${id}`;
   webview.setAttribute('allowpopups', '');
   webview.setAttribute('webpreferences', 'contextIsolation=yes, nodeIntegration=no, javascript=yes, webgl=yes');
   webview.setAttribute('partition', 'persist:browser');
   webview.setAttribute('useragent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
   webview.src = url;
-  browsersContainer.appendChild(webview);
 
-  // Create tab
-  const tab = document.createElement('div');
-  tab.className = 'tab';
-  tab.dataset.id = id;
-  tab.innerHTML = `
-    <span class="tab-title">New Tab</span>
-    <span class="tab-close">×</span>
-  `;
+  webContainer.appendChild(webview);
 
-  // Insert before the + button
-  browserTabBar.insertBefore(tab, newBrowserTabBtn);
+  panelEl.appendChild(toolbar);
+  panelEl.appendChild(webContainer);
 
-  // Tab click handler
-  tab.addEventListener('click', (e) => {
-    if (e.target.classList.contains('tab-close')) {
-      closeBrowserTab(id);
+  // Insert panel BEFORE drop overlay
+  panelsContainer.insertBefore(panelEl, dropOverlay);
+
+  // Webview navigation helpers
+  function navigateToUrl() {
+    let target = urlInput.value.trim();
+    if (!target.startsWith('http://') && !target.startsWith('https://') && !target.startsWith('file://')) {
+      target = 'https://' + target;
+    }
+    webview.src = target;
+  }
+
+  backBtn.addEventListener('click', () => {
+    if (webview.canGoBack()) webview.goBack();
+  });
+
+  forwardBtn.addEventListener('click', () => {
+    if (webview.canGoForward()) webview.goForward();
+  });
+
+  reloadBtn.addEventListener('click', () => {
+    webview.reload();
+  });
+
+  feedbackBtn.addEventListener('click', () => {
+    if (activeTabId === id) {
+      toggleFeedbackMode();
     } else {
-      switchToBrowserTab(id);
+      soloSelectTab(id);
+      toggleFeedbackMode();
     }
   });
 
-  // Update tab title when page loads
+  goBtn.addEventListener('click', navigateToUrl);
+
+  urlInput.addEventListener('keypress', (e) => {
+    if (e.key === 'Enter') navigateToUrl();
+  });
+
+  // Webview events
   webview.addEventListener('page-title-updated', (e) => {
-    const title = e.title || 'New Tab';
-    tab.querySelector('.tab-title').textContent = title.length > 20 ? title.substring(0, 20) + '...' : title;
+    const title = e.title || 'Web';
+    const tab = tabs.get(id);
+    if (tab) {
+      tab.label = title.length > 25 ? title.substring(0, 25) + '...' : title;
+      tab.tabEl.querySelector('.tab-title').textContent = tab.label;
+    }
   });
 
-  // Debug: Log load failures
+  webview.addEventListener('did-navigate', (e) => {
+    if (activeTabId === id) {
+      urlInput.value = e.url;
+    }
+  });
+
+  webview.addEventListener('did-navigate-in-page', (e) => {
+    if (activeTabId === id) {
+      urlInput.value = e.url;
+    }
+  });
+
   webview.addEventListener('did-fail-load', (e) => {
-    console.error('=== WEBVIEW LOAD FAILURE ===');
-    console.error('URL:', e.validatedURL);
-    console.error('Error code:', e.errorCode);
-    console.error('Error description:', e.errorDescription);
-    console.error('Is main frame:', e.isMainFrame);
+    console.error('Webview load failure:', e.validatedURL, e.errorCode, e.errorDescription);
   });
 
-  // Debug: Track navigation
   webview.addEventListener('will-navigate', (e) => {
+    if (activeTabId === id) {
+      urlInput.value = e.url;
+    }
     console.log('Will navigate to:', e.url);
-  });
-
-  webview.addEventListener('did-start-navigation', (e) => {
-    console.log('Did start navigation:', e.url, 'isMainFrame:', e.isMainFrame);
   });
 
   webview.addEventListener('dom-ready', () => {
     console.log('DOM ready for:', webview.getURL());
+    if (feedbackMode && activeTabId === id) {
+      webview.executeJavaScript(feedbackScript);
+    }
   });
 
-  // Detect render process crashes
   webview.addEventListener('crashed', () => {
-    console.error('=== WEBVIEW CRASHED ===');
+    console.error('Webview crashed');
   });
 
   webview.addEventListener('render-process-gone', (e) => {
-    console.error('=== RENDER PROCESS GONE ===');
-    console.error('Reason:', e.reason);
-
-    // Auto-reload disabled for debugging
-    // if (e.reason !== 'killed' && e.reason !== 'clean-exit') {
-    //   console.log('Attempting to reload webview...');
-    //   setTimeout(() => {
-    //     try {
-    //       webview.reload();
-    //     } catch (err) {
-    //       console.error('Failed to reload:', err);
-    //     }
-    //   }, 1000);
-    // }
+    console.error('Render process gone:', e.reason);
   });
 
   webview.addEventListener('destroyed', () => {
-    console.error('=== WEBVIEW DESTROYED ===');
+    console.error('Webview destroyed');
   });
 
   webview.addEventListener('unresponsive', () => {
-    console.error('=== WEBVIEW UNRESPONSIVE ===');
-  });
-
-  webview.addEventListener('responsive', () => {
-    console.log('Webview became responsive again');
+    console.error('Webview unresponsive');
   });
 
   webview.addEventListener('did-finish-load', () => {
     console.log('Webview finished loading:', webview.getURL());
   });
 
-  webview.addEventListener('did-start-loading', () => {
-    console.log('Webview started loading:', webview.src);
-  });
-
-  // Update URL bar when navigation happens (only for active tab)
-  webview.addEventListener('did-navigate', (e) => {
-    if (activeBrowserId === id) {
-      urlInput.value = e.url;
+  // Console message listener for feedback mode
+  webview.addEventListener('console-message', (e) => {
+    if (e.message && e.message.startsWith('__JANUS_ELEMENT_SELECTED__:')) {
+      const jsonStr = e.message.replace('__JANUS_ELEMENT_SELECTED__:', '');
+      try {
+        selectedElementData = JSON.parse(jsonStr);
+        const x = selectedElementData.screenX - window.screenX;
+        const y = selectedElementData.screenY - window.screenY;
+        showFeedbackPopup(x, y);
+      } catch (err) {
+        console.error('Failed to parse element data:', err);
+        disableFeedbackMode();
+      }
     }
   });
 
-  webview.addEventListener('did-navigate-in-page', (e) => {
-    if (activeBrowserId === id) {
-      urlInput.value = e.url;
+  // Click in panel activates this tab
+  panelEl.addEventListener('mousedown', () => {
+    if (activeTabId !== id) {
+      activateTab(id);
     }
   });
 
-  // Store browser info
-  browsers.set(id, { webview, tab });
+  // Build tab object
+  const tab = {
+    id,
+    type: 'web',
+    label: 'Web',
+    visible: false,
+    tabEl: null,
+    panelEl,
+    typeState: { webview, urlInput, feedbackBtn, webContainer }
+  };
 
-  // Switch to this tab
-  switchToBrowserTab(id);
+  const tabEl = buildTabEl(tab);
+  tab.tabEl = tabEl;
+  tabBar.insertBefore(tabEl, newTabBtn);
+
+  tabs.set(id, tab);
+
+  // Solo select this new tab
+  soloSelectTab(id);
 
   return id;
 }
 
-function switchToBrowserTab(id) {
-  // Deactivate all
-  for (const [browserId, browserInfo] of browsers) {
-    browserInfo.webview.classList.remove('active');
-    browserInfo.tab.classList.remove('active');
-  }
 
-  // Activate selected
-  const browserInfo = browsers.get(id);
-  if (browserInfo) {
-    browserInfo.webview.classList.add('active');
-    browserInfo.tab.classList.add('active');
-    activeBrowserId = id;
+// ===== TERMINAL TAB =====
+async function createTerminalTab(cwd) {
+  const id = nextTabId++;
 
-    // Update URL bar
-    try {
-      urlInput.value = browserInfo.webview.getURL() || '';
-    } catch (e) {
-      urlInput.value = browserInfo.webview.src || '';
-    }
+  // Spawn PTY
+  const ptyId = await window.electronAPI.createTerminal(cwd);
+  ptyToTabId.set(ptyId, id);
 
-    // Select browser pane
-    selectPane('browser');
-  }
-}
+  // Build panel
+  const panelEl = document.createElement('div');
+  panelEl.className = 'tab-panel';
+  panelEl.dataset.tabId = id;
 
-function closeBrowserTab(id) {
-  const browserInfo = browsers.get(id);
-  if (!browserInfo) return;
+  // Terminal container (position relative for the scroll button)
+  const terminalContainer = document.createElement('div');
+  terminalContainer.className = 'terminal-container';
 
-  // Remove DOM elements
-  browserInfo.webview.remove();
-  browserInfo.tab.remove();
+  // Terminal element (xterm renders here)
+  const termEl = document.createElement('div');
+  termEl.className = 'terminal-el';
+  terminalContainer.appendChild(termEl);
 
-  // Remove from map
-  browsers.delete(id);
+  // Per-terminal scroll-to-bottom button
+  const scrollBtn = document.createElement('button');
+  scrollBtn.className = 'scroll-to-bottom-btn';
+  scrollBtn.title = 'Scroll to bottom';
+  scrollBtn.textContent = '↓';
+  terminalContainer.appendChild(scrollBtn);
 
-  // Switch to another tab or create new one
-  if (browsers.size === 0) {
-    createBrowserTab();
-  } else if (activeBrowserId === id) {
-    const firstId = browsers.keys().next().value;
-    switchToBrowserTab(firstId);
-  }
-}
+  panelEl.appendChild(terminalContainer);
 
-function getActiveBrowser() {
-  if (activeBrowserId) {
-    const browserInfo = browsers.get(activeBrowserId);
-    return browserInfo ? browserInfo.webview : null;
-  }
-  return null;
-}
+  // Insert panel BEFORE drop overlay
+  panelsContainer.insertBefore(panelEl, dropOverlay);
 
-// New browser tab button
-newBrowserTabBtn.addEventListener('click', () => createBrowserTab());
-
-// Create initial browser tab
-createBrowserTab();
-
-// Browser controls
-document.getElementById('back-btn').addEventListener('click', () => {
-  const browser = getActiveBrowser();
-  if (browser && browser.canGoBack()) browser.goBack();
-});
-
-document.getElementById('forward-btn').addEventListener('click', () => {
-  const browser = getActiveBrowser();
-  if (browser && browser.canGoForward()) browser.goForward();
-});
-
-document.getElementById('reload-btn').addEventListener('click', () => {
-  const browser = getActiveBrowser();
-  if (browser) browser.reload();
-});
-
-document.getElementById('go-btn').addEventListener('click', navigateToUrl);
-
-urlInput.addEventListener('keypress', (e) => {
-  if (e.key === 'Enter') navigateToUrl();
-});
-
-function navigateToUrl() {
-  let url = urlInput.value.trim();
-  if (!url.startsWith('http://') && !url.startsWith('https://') && !url.startsWith('file://')) {
-    url = 'https://' + url;
-  }
-  const browser = getActiveBrowser();
-  if (browser) {
-    console.log('Navigating to:', url);
-    browser.src = url;
-  }
-}
-
-// ===== DRAG AND DROP FILE SUPPORT =====
-const dropOverlay = document.getElementById('drop-overlay');
-let dragCounter = 0;
-
-function disableWebviewPointerEvents() {
-  for (const [id, browserInfo] of browsers) {
-    browserInfo.webview.style.pointerEvents = 'none';
-  }
-}
-
-function enableWebviewPointerEvents() {
-  for (const [id, browserInfo] of browsers) {
-    browserInfo.webview.style.pointerEvents = '';
-  }
-}
-
-// Detect when files are dragged into the window
-document.addEventListener('dragenter', (e) => {
-  e.preventDefault();
-  // Only show overlay for file drags
-  if (e.dataTransfer.types.includes('Files')) {
-    dragCounter++;
-    if (dragCounter === 1) {
-      dropOverlay.classList.add('visible');
-      disableWebviewPointerEvents();
-    }
-  }
-});
-
-document.addEventListener('dragleave', (e) => {
-  e.preventDefault();
-  dragCounter--;
-  if (dragCounter === 0) {
-    dropOverlay.classList.remove('visible');
-    enableWebviewPointerEvents();
-  }
-});
-
-document.addEventListener('dragover', (e) => {
-  e.preventDefault();
-});
-
-// Handle drop on the overlay
-dropOverlay.addEventListener('drop', (e) => {
-  e.preventDefault();
-  e.stopPropagation();
-  dragCounter = 0;
-  dropOverlay.classList.remove('visible');
-  enableWebviewPointerEvents();
-
-  const files = e.dataTransfer.files;
-  if (files.length > 0) {
-    const file = files[0];
-    // Use the file path from Electron's file object
-    const filePath = file.path;
-    if (filePath) {
-      // Check if drop is over the terminal panel
-      const terminalPanel = document.getElementById('terminal-panel');
-      const terminalRect = terminalPanel.getBoundingClientRect();
-      const isOverTerminal = e.clientX >= terminalRect.left &&
-                             e.clientX <= terminalRect.right &&
-                             e.clientY >= terminalRect.top &&
-                             e.clientY <= terminalRect.bottom;
-
-      if (isOverTerminal && activeTerminalId) {
-        // Insert file path into active terminal (escape spaces and special chars)
-        const escapedPath = filePath.replace(/([ "'\\$`!])/g, '\\$1');
-        window.electronAPI.sendTerminalInput(activeTerminalId, escapedPath);
-      } else {
-        // Navigate browser to file
-        const fileUrl = 'file://' + filePath;
-        urlInput.value = fileUrl;
-        const browser = getActiveBrowser();
-        if (browser) browser.src = fileUrl;
-      }
-    }
-  }
-});
-
-// Prevent default drop behavior elsewhere
-document.addEventListener('drop', (e) => {
-  e.preventDefault();
-  dragCounter = 0;
-  dropOverlay.classList.remove('visible');
-  enableWebviewPointerEvents();
-});
-
-
-// ===== TERMINAL TAB MANAGEMENT =====
-const terminals = new Map();
-let activeTerminalId = null;
-
-const tabBar = document.getElementById('tab-bar');
-const terminalsContainer = document.getElementById('terminals-container');
-const newTabBtn = document.getElementById('new-tab-btn');
-
-// Terminal zoom state
-let terminalFontSize = 14;
-const MIN_FONT_SIZE = 8;
-const MAX_FONT_SIZE = 32;
-
-function setTerminalFontSize(size) {
-  terminalFontSize = Math.max(MIN_FONT_SIZE, Math.min(MAX_FONT_SIZE, size));
-
-  // Update all terminal instances
-  for (const [id, termInfo] of terminals) {
-    termInfo.term.options.fontSize = terminalFontSize;
-    fitTerminal(termInfo, id);
-  }
-}
-
-function zoomInTerminal() {
-  setTerminalFontSize(terminalFontSize + 2);
-}
-
-function zoomOutTerminal() {
-  setTerminalFontSize(terminalFontSize - 2);
-}
-
-async function createTab() {
-  const id = await window.electronAPI.createTerminal();
-
-  // Create terminal instance with current font size
+  // Create xterm instance
   const term = new Terminal({
     cursorBlink: true,
     fontSize: terminalFontSize,
@@ -440,322 +360,607 @@ async function createTab() {
 
   const fitAddon = new FitAddon.FitAddon();
   term.loadAddon(fitAddon);
+  term.open(termEl);
 
-  // Create container for this terminal
-  const container = document.createElement('div');
-  container.className = 'terminal-instance';
-  container.id = `terminal-${id}`;
-  terminalsContainer.appendChild(container);
+  // Auto-follow bottom enabled by default
+  terminalFollowBottom.set(ptyId, true);
 
-  term.open(container);
-
-  // Create tab
-  const tab = document.createElement('div');
-  tab.className = 'tab';
-  tab.dataset.id = id;
-  tab.innerHTML = `
-    <span class="tab-title">Terminal ${id}</span>
-    <span class="tab-close">×</span>
-  `;
-
-  // Insert before the + button
-  tabBar.insertBefore(tab, newTabBtn);
-
-  // Tab click handler
-  tab.addEventListener('click', (e) => {
-    if (e.target.classList.contains('tab-close')) {
-      closeTab(id);
-    } else {
-      switchToTab(id);
-    }
-  });
-
-  // Terminal input handler
+  // Terminal data input: re-enable auto-follow on any keystroke
   term.onData((data) => {
-    window.electronAPI.sendTerminalInput(id, data);
+    window.electronAPI.sendTerminalInput(ptyId, data);
+    terminalFollowBottom.set(ptyId, true);
   });
 
-  // Track scroll position for scroll-to-bottom button
-  // Use only term.onScroll - it fires for all scroll changes including wheel events
+  // Scroll debounce state for this terminal's scroll button
+  let scrollUpdateTimer = null;
+  let lastScrollUpdateTime = 0;
+  const SCROLL_UPDATE_DEBOUNCE = 50;
+
+  function updateScrollBtnVisibility() {
+    if (scrollUpdateTimer) clearTimeout(scrollUpdateTimer);
+    const now = Date.now();
+    const elapsed = now - lastScrollUpdateTime;
+    if (elapsed < SCROLL_UPDATE_DEBOUNCE) {
+      scrollUpdateTimer = setTimeout(doScrollBtnUpdate, SCROLL_UPDATE_DEBOUNCE - elapsed);
+      return;
+    }
+    doScrollBtnUpdate();
+  }
+
+  function doScrollBtnUpdate() {
+    scrollUpdateTimer = null;
+    lastScrollUpdateTime = Date.now();
+    const buffer = term.buffer.active;
+    const isAtBottom = buffer.viewportY >= buffer.baseY;
+    if (isAtBottom) {
+      scrollBtn.classList.remove('visible');
+    } else {
+      scrollBtn.classList.add('visible');
+    }
+  }
+
+  // Wheel events disable follow mode when user scrolls up
+  terminalContainer.addEventListener('wheel', () => {
+    requestAnimationFrame(() => {
+      const buffer = term.buffer.active;
+      terminalFollowBottom.set(ptyId, buffer.viewportY >= buffer.baseY);
+      updateScrollBtnVisibility();
+    });
+  }, { passive: true });
+
   term.onScroll(() => {
-    if (id === activeTerminalId) {
-      updateScrollButtonVisibility();
+    updateScrollBtnVisibility();
+  });
+
+  scrollBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    terminalFollowBottom.set(ptyId, true);
+    term.scrollToBottom();
+    scrollBtn.classList.remove('visible');
+  });
+
+  // Per-terminal ResizeObserver
+  const resizeObserver = new ResizeObserver(() => {
+    const tab = tabs.get(id);
+    if (tab && tab.visible) {
+      debouncedFitTerminal(id);
+    }
+  });
+  resizeObserver.observe(terminalContainer);
+
+  // Click in panel activates this tab
+  panelEl.addEventListener('mousedown', () => {
+    if (activeTabId !== id) {
+      activateTab(id);
+      setTimeout(() => term.focus(), 10);
     }
   });
 
-  // Store terminal info
-  terminals.set(id, { term, fitAddon, container, tab });
+  // Build tab object
+  const tab = {
+    id,
+    type: 'terminal',
+    label: `Terminal ${id}`,
+    visible: false,
+    tabEl: null,
+    panelEl,
+    typeState: { ptyId, term, fitAddon, terminalContainer, termEl, scrollBtn }
+  };
 
-  // Switch to this tab
-  switchToTab(id);
+  const tabEl = buildTabEl(tab);
+  tab.tabEl = tabEl;
+  tabBar.insertBefore(tabEl, newTabBtn);
 
-  // Fit after a short delay
+  tabs.set(id, tab);
+
+  // Solo select this new tab
+  soloSelectTab(id);
+
+  // Fit after layout is established
   setTimeout(() => {
-    fitTerminal(terminals.get(id), id);
+    fitTerminal(id);
+    term.focus();
   }, 100);
 
   return id;
 }
 
-function switchToTab(id) {
-  // Deactivate all
-  for (const [termId, termInfo] of terminals) {
-    termInfo.container.classList.remove('active');
-    termInfo.tab.classList.remove('active');
+
+// ===== CUMULUS TAB =====
+let cumulusTabCounter = 0;
+
+function createCumulusTab(threadName) {
+  const id = nextTabId++;
+  cumulusTabCounter++;
+
+  // Default thread name based on counter; will be overridden with project name
+  if (!threadName) {
+    threadName = `chat-${cumulusTabCounter}`;
   }
 
-  // Activate selected
-  const termInfo = terminals.get(id);
-  if (termInfo) {
-    termInfo.container.classList.add('active');
-    termInfo.tab.classList.add('active');
-    activeTerminalId = id;
+  const panelEl = document.createElement('div');
+  panelEl.className = 'tab-panel';
+  panelEl.dataset.tabId = id;
 
-    // Fit and focus
-    setTimeout(() => {
-      fitTerminal(termInfo, id);
-      termInfo.term.focus();
-      // Update scroll button for new active terminal
-      updateScrollButtonVisibility();
-    }, 50);
+  const container = document.createElement('div');
+  container.className = 'cumulus-container';
+  panelEl.appendChild(container);
+  panelsContainer.insertBefore(panelEl, dropOverlay);
 
-    // Select terminal pane
-    selectPane('terminal');
-  }
-}
-
-function closeTab(id) {
-  const termInfo = terminals.get(id);
-  if (!termInfo) return;
-
-  // Kill the PTY
-  window.electronAPI.killTerminal(id);
-
-  // Remove DOM elements
-  termInfo.container.remove();
-  termInfo.tab.remove();
-  termInfo.term.dispose();
-
-  // Remove from map
-  terminals.delete(id);
-
-  // Switch to another tab or create new one
-  if (terminals.size === 0) {
-    createTab();
-  } else if (activeTerminalId === id) {
-    const firstId = terminals.keys().next().value;
-    switchToTab(firstId);
-  }
-}
-
-// Fit a terminal while preserving scroll position.
-// xterm.js can shift the viewport during reflow, causing the terminal to
-// flash between top and bottom when there is a large scrollback buffer.
-function fitTerminal(termInfo, id) {
-  const buffer = termInfo.term.buffer.active;
-  const wasAtBottom = buffer.viewportY >= buffer.baseY;
-
-  termInfo.fitAddon.fit();
-
-  // After fit/reflow, restore scroll position if user was at the bottom
-  if (wasAtBottom) {
-    termInfo.term.scrollToBottom();
-  }
-
-  window.electronAPI.resizeTerminal(id, termInfo.term.cols, termInfo.term.rows);
-}
-
-// Handle resize for active terminal
-function resizeActiveTerminal() {
-  if (activeTerminalId) {
-    const termInfo = terminals.get(activeTerminalId);
-    if (termInfo) {
-      fitTerminal(termInfo, activeTerminalId);
+  panelEl.addEventListener('mousedown', () => {
+    if (activeTabId !== id) {
+      activateTab(id);
     }
+  });
+
+  const tab = {
+    id,
+    type: 'cumulus',
+    label: 'Chat',
+    visible: false,
+    tabEl: null,
+    panelEl,
+    typeState: { container, threadName, reactRoot: null }
+  };
+
+  const tabEl = buildTabEl(tab);
+  tab.tabEl = tabEl;
+  tabBar.insertBefore(tabEl, newTabBtn);
+
+  tabs.set(id, tab);
+
+  // Use project folder name as thread name for the first chat tab
+  if (cumulusTabCounter === 1) {
+    window.electronAPI.getProjectPath().then(projectPath => {
+      if (projectPath) {
+        const folderName = projectPath.split('/').pop() || 'default';
+        tab.typeState.threadName = folderName;
+        threadName = folderName;
+      }
+      mountCumulusReact(tab, container, threadName);
+    });
+  } else {
+    mountCumulusReact(tab, container, threadName);
   }
+
+  soloSelectTab(id);
+
+  return id;
 }
 
-// Debounced resize to prevent feedback loops from ResizeObserver/window resize.
-// fit() can trigger re-renders that re-fire the observer; batching into a
-// single animation frame breaks the cycle.
-let resizeRAF = null;
-function debouncedResizeActiveTerminal() {
-  if (resizeRAF) cancelAnimationFrame(resizeRAF);
-  resizeRAF = requestAnimationFrame(() => {
-    resizeRAF = null;
-    resizeActiveTerminal();
+function mountCumulusReact(tab, container, threadName) {
+  if (typeof window.mountCumulusChat !== 'function') {
+    container.textContent = 'Chat bundle not loaded';
+    container.style.display = 'flex';
+    container.style.alignItems = 'center';
+    container.style.justifyContent = 'center';
+    container.style.color = 'rgba(255, 255, 255, 0.4)';
+    container.style.fontSize = '18px';
+    return;
+  }
+
+  window.electronAPI.cumulusCreateThread(threadName).then(() => {
+    const api = {
+      sendMessage: (msg) => window.electronAPI.cumulusSendMessage(threadName, msg),
+      kill: () => window.electronAPI.cumulusKill(threadName),
+      getHistory: (count) => window.electronAPI.cumulusGetHistory(threadName, count),
+      listThreads: () => window.electronAPI.cumulusListThreads(),
+      threadName,
+      onMessage: (cb) => window.electronAPI.onCumulusMessage(cb),
+      onStreamChunk: (cb) => window.electronAPI.onCumulusStreamChunk(cb),
+      onStreamEnd: (cb) => window.electronAPI.onCumulusStreamEnd(cb),
+      onError: (cb) => window.electronAPI.onCumulusError(cb),
+    };
+    tab.typeState.reactRoot = window.mountCumulusChat(container, api);
   });
 }
 
-window.addEventListener('resize', debouncedResizeActiveTerminal);
-new ResizeObserver(debouncedResizeActiveTerminal).observe(terminalsContainer);
 
-// Handle terminal data from main process
-window.electronAPI.onTerminalData((id, data) => {
-  const termInfo = terminals.get(id);
-  if (termInfo) {
-    termInfo.term.write(data);
-    // Update scroll button after data is written (buffer state may have changed)
-    if (id === activeTerminalId) {
-      setTimeout(updateScrollButtonVisibility, 0);
+// ===== TAB ACTIVATION (active highlight only, no visibility change) =====
+function activateTab(id) {
+  if (!tabs.has(id)) return;
+  activeTabId = id;
+
+  for (const [tid, tab] of tabs) {
+    if (tab.visible) {
+      tab.tabEl.classList.add('tab-visible');
+    } else {
+      tab.tabEl.classList.remove('tab-visible');
+    }
+    if (tid === id) {
+      tab.tabEl.classList.add('active');
+    } else {
+      tab.tabEl.classList.remove('active');
     }
   }
-});
 
-// New tab button
-newTabBtn.addEventListener('click', createTab);
-
-// ===== SCROLL TO BOTTOM BUTTON =====
-const scrollToBottomBtn = document.getElementById('scroll-to-bottom-btn');
-
-// Debounce scroll button visibility updates to prevent rapid flipping
-let scrollUpdateTimer = null;
-let lastScrollUpdateTime = 0;
-const SCROLL_UPDATE_DEBOUNCE = 50; // ms
-
-function updateScrollButtonVisibility() {
-  // Debounce: cancel any pending update and schedule a new one
-  if (scrollUpdateTimer) {
-    clearTimeout(scrollUpdateTimer);
+  // Sync URL input if active tab is web
+  const tab = tabs.get(id);
+  if (tab && tab.type === 'web') {
+    const { webview, urlInput } = tab.typeState;
+    try {
+      urlInput.value = webview.getURL() || urlInput.value;
+    } catch (e) {
+      // webview not ready yet
+    }
   }
-
-  // Throttle: if we just updated, schedule for later
-  const now = Date.now();
-  const timeSinceLastUpdate = now - lastScrollUpdateTime;
-
-  if (timeSinceLastUpdate < SCROLL_UPDATE_DEBOUNCE) {
-    scrollUpdateTimer = setTimeout(doScrollButtonUpdate, SCROLL_UPDATE_DEBOUNCE - timeSinceLastUpdate);
-    return;
-  }
-
-  doScrollButtonUpdate();
 }
 
-function doScrollButtonUpdate() {
-  scrollUpdateTimer = null;
-  lastScrollUpdateTime = Date.now();
 
-  if (!activeTerminalId) {
-    scrollToBottomBtn.classList.remove('visible');
-    return;
+// ===== SOLO SELECT (click: show only this tab) =====
+function soloSelectTab(id) {
+  if (!tabs.has(id)) return;
+
+  for (const [tid, tab] of tabs) {
+    tab.visible = tid === id;
   }
 
-  const termInfo = terminals.get(activeTerminalId);
-  if (!termInfo) {
-    scrollToBottomBtn.classList.remove('visible');
-    return;
+  // Reset all panels to equal flex
+  for (const [, tab] of tabs) {
+    tab.panelEl.style.flex = '';
   }
 
-  const term = termInfo.term;
-  const buffer = term.buffer.active;
-  // baseY is the line at the top of the scrollback buffer that's currently visible
-  // viewportY is where the viewport starts
-  // If viewportY < baseY, user has scrolled up
-  const isAtBottom = buffer.viewportY >= buffer.baseY;
+  activateTab(id);
+  rebuildPanelLayout();
 
-  if (isAtBottom) {
-    scrollToBottomBtn.classList.remove('visible');
+  // Focus terminal if applicable
+  const tab = tabs.get(id);
+  if (tab && tab.type === 'terminal') {
+    setTimeout(() => {
+      fitTerminal(id);
+      tab.typeState.term.focus();
+    }, 50);
+  }
+}
+
+
+// ===== TOGGLE VISIBILITY (cmd+click) =====
+function toggleTabVisibility(id) {
+  const tab = tabs.get(id);
+  if (!tab) return;
+
+  const visibleTabs = [...tabs.values()].filter(t => t.visible);
+
+  if (tab.visible) {
+    // Cannot hide the last visible tab
+    if (visibleTabs.length <= 1) return;
+
+    tab.visible = false;
+
+    // If we hid the active tab, activate another visible one
+    if (activeTabId === id) {
+      const nextVisible = [...tabs.values()].find(t => t.visible);
+      if (nextVisible) {
+        activateTab(nextVisible.id);
+      }
+    }
   } else {
-    scrollToBottomBtn.classList.add('visible');
+    tab.visible = true;
+    activateTab(id);
+  }
+
+  rebuildPanelLayout();
+
+  // Fit any newly visible terminals
+  for (const [tid, t] of tabs) {
+    if (t.visible && t.type === 'terminal') {
+      setTimeout(() => fitTerminal(tid), 50);
+    }
   }
 }
 
-function scrollTerminalToBottom() {
-  if (!activeTerminalId) return;
 
-  const termInfo = terminals.get(activeTerminalId);
-  if (!termInfo) return;
+// ===== PANEL LAYOUT =====
+function rebuildPanelLayout() {
+  // Remove all existing resize handles
+  const handles = panelsContainer.querySelectorAll('.resize-handle');
+  handles.forEach(h => h.remove());
 
-  termInfo.term.scrollToBottom();
-  scrollToBottomBtn.classList.remove('visible');
+  const visibleTabs = [...tabs.values()].filter(t => t.visible);
+  const hiddenTabs = [...tabs.values()].filter(t => !t.visible);
+
+  // Hide non-visible panels
+  for (const tab of hiddenTabs) {
+    tab.panelEl.classList.add('panel-hidden');
+    tab.panelEl.style.order = '9999';
+  }
+
+  // Assign order and insert resize handles for visible panels
+  visibleTabs.forEach((tab, idx) => {
+    tab.panelEl.classList.remove('panel-hidden');
+    tab.panelEl.style.order = String(idx * 2);
+
+    if (idx < visibleTabs.length - 1) {
+      const handle = document.createElement('div');
+      handle.className = 'resize-handle';
+      handle.style.order = String(idx * 2 + 1);
+      panelsContainer.appendChild(handle);
+
+      // Store which panels this handle separates
+      const leftTab = tab;
+      const rightTab = visibleTabs[idx + 1];
+
+      handle.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        disableWebviewPointerEvents();
+        document.body.style.cursor = 'col-resize';
+
+        resizeDragState = {
+          leftPanelEl: leftTab.panelEl,
+          rightPanelEl: rightTab.panelEl,
+          startX: e.clientX,
+          startLeftWidth: leftTab.panelEl.getBoundingClientRect().width,
+          startRightWidth: rightTab.panelEl.getBoundingClientRect().width
+        };
+      });
+    }
+  });
+
+  // Update tab bar visible indicator
+  for (const [, tab] of tabs) {
+    if (tab.visible) {
+      tab.tabEl.classList.add('tab-visible');
+    } else {
+      tab.tabEl.classList.remove('tab-visible');
+    }
+  }
 }
 
-scrollToBottomBtn.addEventListener('click', (e) => {
-  e.stopPropagation();
-  scrollTerminalToBottom();
-});
 
-// Zoom buttons
-document.getElementById('zoom-in-btn').addEventListener('click', zoomInTerminal);
-document.getElementById('zoom-out-btn').addEventListener('click', zoomOutTerminal);
-
-// Browser panel toggle button
-document.getElementById('toggle-browser-btn').addEventListener('click', toggleBrowserPanel);
-
-// Initial tab will be created after project folder selection (see initProjectFolder)
-
-
-// ===== PANEL RESIZING =====
-const divider = document.getElementById('divider');
-const container = document.querySelector('.container');
-const leftPanel = document.getElementById('browser-panel');
-const rightPanel = document.getElementById('terminal-panel');
-
-let isResizing = false;
-
-divider.addEventListener('mousedown', (e) => {
-  isResizing = true;
-  document.body.style.cursor = 'col-resize';
-  // Disable pointer events on all webviews to prevent them from capturing mouse
-  for (const [id, browserInfo] of browsers) {
-    browserInfo.webview.style.pointerEvents = 'none';
-  }
-  e.preventDefault();
-});
-
+// ===== RESIZE HANDLE MOUSE EVENTS =====
 document.addEventListener('mousemove', (e) => {
-  if (!isResizing) return;
+  if (!resizeDragState) return;
 
-  const containerRect = container.getBoundingClientRect();
-  const percentage = ((e.clientX - containerRect.left) / containerRect.width) * 100;
+  const { leftPanelEl, rightPanelEl, startX, startLeftWidth, startRightWidth } = resizeDragState;
+  const delta = e.clientX - startX;
+  const newLeftWidth = Math.max(200, startLeftWidth + delta);
+  const newRightWidth = Math.max(200, startRightWidth - delta);
 
-  if (percentage > 20 && percentage < 80) {
-    leftPanel.style.flex = `0 0 ${percentage}%`;
-    rightPanel.style.flex = `0 0 ${100 - percentage}%`;
-    debouncedResizeActiveTerminal();
+  leftPanelEl.style.flex = `0 0 ${newLeftWidth}px`;
+  rightPanelEl.style.flex = `0 0 ${newRightWidth}px`;
+
+  // Fit all visible terminals during resize
+  for (const [id, tab] of tabs) {
+    if (tab.visible && tab.type === 'terminal') {
+      fitTerminal(id);
+    }
   }
 });
 
 document.addEventListener('mouseup', () => {
-  if (isResizing) {
-    isResizing = false;
+  if (resizeDragState) {
+    resizeDragState = null;
     document.body.style.cursor = '';
-    // Re-enable pointer events on all webviews
-    for (const [id, browserInfo] of browsers) {
-      browserInfo.webview.style.pointerEvents = '';
+    enableWebviewPointerEvents();
+  }
+});
+
+
+// ===== WEBVIEW POINTER EVENTS (disable during resize/drag) =====
+function disableWebviewPointerEvents() {
+  for (const [, tab] of tabs) {
+    if (tab.type === 'web') {
+      tab.typeState.webview.style.pointerEvents = 'none';
     }
+  }
+}
+
+function enableWebviewPointerEvents() {
+  for (const [, tab] of tabs) {
+    if (tab.type === 'web') {
+      tab.typeState.webview.style.pointerEvents = '';
+    }
+  }
+}
+
+
+// ===== CLOSE TAB =====
+function closeTab(id) {
+  const tab = tabs.get(id);
+  if (!tab) return;
+
+  const wasVisible = tab.visible;
+  const wasActive = activeTabId === id;
+
+  // Terminal cleanup
+  if (tab.type === 'terminal') {
+    const { ptyId, term } = tab.typeState;
+    window.electronAPI.killTerminal(ptyId);
+    ptyToTabId.delete(ptyId);
+    terminalFollowBottom.delete(ptyId);
+    pendingWrites.delete(ptyId);
+    term.dispose();
+  }
+
+  // Cumulus cleanup
+  if (tab.type === 'cumulus') {
+    if (tab.typeState.reactRoot && typeof window.unmountCumulusChat === 'function') {
+      window.unmountCumulusChat(tab.typeState.reactRoot);
+    }
+    window.electronAPI.cumulusKill(tab.typeState.threadName);
+  }
+
+  // Remove DOM elements
+  tab.tabEl.remove();
+  tab.panelEl.remove();
+
+  tabs.delete(id);
+
+  // If no tabs left, create a new terminal tab
+  if (tabs.size === 0) {
+    createTerminalTab();
+    return;
+  }
+
+  // If the closed tab was visible, reassign visibility
+  if (wasVisible) {
+    const visibleRemaining = [...tabs.values()].filter(t => t.visible);
+
+    if (visibleRemaining.length === 0) {
+      // Make the first available tab visible
+      const first = tabs.values().next().value;
+      if (first) {
+        first.visible = true;
+        activateTab(first.id);
+      }
+    } else if (wasActive) {
+      // Activate the first visible remaining tab
+      activateTab(visibleRemaining[0].id);
+    }
+
+    rebuildPanelLayout();
+
+    // Fit newly active terminal if applicable
+    if (activeTabId) {
+      const activeTab = tabs.get(activeTabId);
+      if (activeTab && activeTab.type === 'terminal') {
+        setTimeout(() => {
+          fitTerminal(activeTabId);
+          activeTab.typeState.term.focus();
+        }, 50);
+      }
+    }
+  }
+}
+
+
+// ===== TERMINAL FIT =====
+function fitTerminal(id) {
+  const tab = tabs.get(id);
+  if (!tab || tab.type !== 'terminal') return;
+  if (!tab.visible) return;
+
+  const { ptyId, term, fitAddon } = tab.typeState;
+  const buffer = term.buffer.active;
+  const wasAtBottom = buffer.viewportY >= buffer.baseY;
+
+  try {
+    fitAddon.fit();
+  } catch (e) {
+    // Can fail if element has no dimensions yet
+    return;
+  }
+
+  if (wasAtBottom) {
+    term.scrollToBottom();
+  }
+
+  window.electronAPI.resizeTerminal(ptyId, term.cols, term.rows);
+}
+
+// Debounced per-terminal fit
+const fitRAFs = new Map(); // tabId -> raf id
+
+function debouncedFitTerminal(id) {
+  if (fitRAFs.has(id)) cancelAnimationFrame(fitRAFs.get(id));
+  const raf = requestAnimationFrame(() => {
+    fitRAFs.delete(id);
+    fitTerminal(id);
+  });
+  fitRAFs.set(id, raf);
+}
+
+window.addEventListener('resize', () => {
+  for (const [id, tab] of tabs) {
+    if (tab.visible && tab.type === 'terminal') {
+      debouncedFitTerminal(id);
+    }
+  }
+});
+
+
+// ===== TERMINAL DATA ROUTING =====
+// Batch rapid writes into a single term.write() per animation frame to prevent
+// scroll flickering during streaming LLM output.
+function flushTerminalWrites() {
+  writeFlushRAF = null;
+  for (const [ptyId, data] of pendingWrites) {
+    const tabId = ptyToTabId.get(ptyId);
+    if (tabId === undefined) continue;
+    const tab = tabs.get(tabId);
+    if (!tab || tab.type !== 'terminal') continue;
+
+    const { term } = tab.typeState;
+    term.write(data, () => {
+      if (terminalFollowBottom.get(ptyId)) {
+        term.scrollToBottom();
+      }
+    });
+  }
+  pendingWrites.clear();
+}
+
+window.electronAPI.onTerminalData((ptyId, data) => {
+  if (!ptyToTabId.has(ptyId)) return;
+
+  const existing = pendingWrites.get(ptyId) || '';
+  pendingWrites.set(ptyId, existing + data);
+
+  if (!writeFlushRAF) {
+    writeFlushRAF = requestAnimationFrame(flushTerminalWrites);
+  }
+});
+
+
+// ===== TERMINAL ZOOM =====
+function setTerminalFontSize(size) {
+  terminalFontSize = Math.max(MIN_FONT_SIZE, Math.min(MAX_FONT_SIZE, size));
+
+  for (const [id, tab] of tabs) {
+    if (tab.type === 'terminal') {
+      tab.typeState.term.options.fontSize = terminalFontSize;
+      fitTerminal(id);
+    }
+  }
+}
+
+function zoomInTerminal() {
+  setTerminalFontSize(terminalFontSize + 2);
+}
+
+function zoomOutTerminal() {
+  setTerminalFontSize(terminalFontSize - 2);
+}
+
+
+// ===== TYPE PICKER =====
+newTabBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  tabTypePicker.classList.toggle('visible');
+
+  if (tabTypePicker.classList.contains('visible')) {
+    // Position picker below the + button using viewport coords (picker is position:fixed)
+    const btnRect = newTabBtn.getBoundingClientRect();
+    tabTypePicker.style.left = btnRect.left + 'px';
+    tabTypePicker.style.top = btnRect.bottom + 2 + 'px';
+  }
+});
+
+tabTypePicker.addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-type]');
+  if (!btn) return;
+
+  tabTypePicker.classList.remove('visible');
+
+  const type = btn.dataset.type;
+  if (type === 'terminal') {
+    createTerminalTab();
+  } else if (type === 'web') {
+    createWebTab();
+  } else if (type === 'cumulus') {
+    createCumulusTab();
+  }
+});
+
+// Close picker on outside click
+document.addEventListener('click', (e) => {
+  if (!tabTypePicker.contains(e.target) && e.target !== newTabBtn) {
+    tabTypePicker.classList.remove('visible');
   }
 });
 
 
 // ===== FEEDBACK MODE =====
-let feedbackMode = false;
-const feedbackBtn = document.getElementById('feedback-btn');
-const feedbackPopup = document.getElementById('feedback-popup');
-const feedbackText = document.getElementById('feedback-text');
-const feedbackSubmit = document.getElementById('feedback-submit');
-
-// Store selected element data
-let selectedElementData = null;
-let selectedElementPosition = { x: 0, y: 0 };
-
-// Map to track element UUIDs and their terminal tabs
-const elementTerminals = new Map();
-
-// Generate UUID for elements
-function generateUUID() {
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-    const r = Math.random() * 16 | 0;
-    const v = c === 'x' ? r : (r & 0x3 | 0x8);
-    return v.toString(16);
-  });
-}
-
-// Generate a unique key for an element based on its selector path
-function getElementKey(elementData) {
-  return elementData.selector || elementData.outerHTML.substring(0, 100);
-}
-
 const feedbackScript = `
 (function() {
   if (window.__janusFeedbackActive) return;
@@ -852,7 +1057,6 @@ const cleanupScript = `
   document.removeEventListener('mouseout', window.__janusMouseOut, true);
   document.removeEventListener('click', window.__janusClick, true);
 
-  // Remove any remaining highlights - check multiple possible formats
   document.querySelectorAll('*').forEach(el => {
     if (el.style.outline && (
         el.style.outline.includes('0066cc') ||
@@ -865,23 +1069,43 @@ const cleanupScript = `
 })();
 `;
 
+function getActiveWebview() {
+  if (!activeTabId) return null;
+  const tab = tabs.get(activeTabId);
+  if (!tab || tab.type !== 'web') return null;
+  return tab.typeState.webview;
+}
+
+function getActiveFeedbackBtn() {
+  if (!activeTabId) return null;
+  const tab = tabs.get(activeTabId);
+  if (!tab || tab.type !== 'web') return null;
+  return tab.typeState.feedbackBtn;
+}
+
 function enableFeedbackMode() {
   feedbackMode = true;
-  feedbackBtn.classList.add('active');
+  const btn = getActiveFeedbackBtn();
+  if (btn) btn.classList.add('active');
 
-  const browser = getActiveBrowser();
-  if (browser) {
-    browser.executeJavaScript(feedbackScript);
+  const webview = getActiveWebview();
+  if (webview) {
+    webview.executeJavaScript(feedbackScript);
   }
 }
 
 function disableFeedbackMode() {
   feedbackMode = false;
-  feedbackBtn.classList.remove('active');
+  // Clear active class on all feedback buttons
+  for (const [, tab] of tabs) {
+    if (tab.type === 'web') {
+      tab.typeState.feedbackBtn.classList.remove('active');
+    }
+  }
 
-  const browser = getActiveBrowser();
-  if (browser) {
-    browser.executeJavaScript(cleanupScript);
+  const webview = getActiveWebview();
+  if (webview) {
+    webview.executeJavaScript(cleanupScript);
   }
 }
 
@@ -894,7 +1118,6 @@ function toggleFeedbackMode() {
 }
 
 function showFeedbackPopup(x, y) {
-  // Make visible first to get dimensions
   feedbackPopup.classList.add('visible');
 
   const popupWidth = feedbackPopup.offsetWidth;
@@ -903,21 +1126,15 @@ function showFeedbackPopup(x, y) {
   const viewportHeight = window.innerHeight;
   const padding = 10;
 
-  // Adjust x to keep popup in viewport
   if (x + popupWidth + padding > viewportWidth) {
     x = viewportWidth - popupWidth - padding;
   }
-  if (x < padding) {
-    x = padding;
-  }
+  if (x < padding) x = padding;
 
-  // Adjust y to keep popup in viewport
   if (y + popupHeight + padding > viewportHeight) {
     y = viewportHeight - popupHeight - padding;
   }
-  if (y < padding) {
-    y = padding;
-  }
+  if (y < padding) y = padding;
 
   feedbackPopup.style.left = x + 'px';
   feedbackPopup.style.top = y + 'px';
@@ -930,17 +1147,32 @@ function hideFeedbackPopup() {
   selectedElementData = null;
 }
 
-// Create or get terminal tab for element
+function generateUUID() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+    const r = Math.random() * 16 | 0;
+    const v = c === 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+}
+
+function getElementKey(elementData) {
+  return elementData.selector || elementData.outerHTML.substring(0, 100);
+}
+
+// Create or reuse a terminal tab for a given element
 async function getOrCreateElementTerminal(elementKey) {
   if (elementTerminals.has(elementKey)) {
     const terminalInfo = elementTerminals.get(elementKey);
-    switchToTab(terminalInfo.tabId);
-    return terminalInfo;
+    // Verify tab still exists
+    if (tabs.has(terminalInfo.tabId)) {
+      soloSelectTab(terminalInfo.tabId);
+      return terminalInfo;
+    }
+    elementTerminals.delete(elementKey);
   }
 
-  // Generate new UUID and create terminal
   const uuid = generateUUID();
-  const tabId = await createTab();
+  const tabId = await createTerminalTab();
 
   const terminalInfo = { tabId, uuid };
   elementTerminals.set(elementKey, terminalInfo);
@@ -948,7 +1180,6 @@ async function getOrCreateElementTerminal(elementKey) {
   return terminalInfo;
 }
 
-// Send feedback to claude CLI
 async function submitFeedback() {
   const feedback = feedbackText.value.trim();
 
@@ -958,61 +1189,23 @@ async function submitFeedback() {
     return;
   }
 
-  const elementKey = getElementKey(selectedElementData);
-  const terminalInfo = await getOrCreateElementTerminal(elementKey);
-
-  // Format the message for claude using heredoc to avoid escaping issues
-  const message = `\`\`\`html
-${selectedElementData.outerHTML}
-\`\`\`
-
-User Feedback: ${feedback}`;
-
-  // Get the terminal and send the claude command using heredoc
-  const termInfo = terminals.get(terminalInfo.tabId);
-  if (termInfo) {
-    // Use heredoc to pass multi-line content safely
-    const claudeCommand = `claude --dangerously-skip-permissions -p "$(cat <<'ENDFEEDBACK'
-${message}
-ENDFEEDBACK
-)"
-`;
-    window.electronAPI.sendTerminalInput(terminalInfo.tabId, claudeCommand);
+  // Truncate outerHTML to avoid overwhelming the chat with huge markup
+  let html = selectedElementData.outerHTML;
+  if (html.length > 2000) {
+    html = html.substring(0, 2000) + '\n... (truncated)';
   }
+
+  const message = `I selected this element on the page:\n\nSelector: \`${selectedElementData.selector}\`\nTag: \`${selectedElementData.tagName}\`\n\n\`\`\`html\n${html}\n\`\`\`\n\nFeedback: ${feedback}`;
+
+  // Route to cumulus chat instead of spawning throwaway terminal
+  sendToCumulusChat(message);
 
   hideFeedbackPopup();
   disableFeedbackMode();
 }
 
-// Feedback button click handler
-feedbackBtn.addEventListener('click', toggleFeedbackMode);
-
-// Feedback popup submit
 feedbackSubmit.addEventListener('click', submitFeedback);
 
-// ESC key to exit feedback mode or close popup
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') {
-    if (feedbackPopup.classList.contains('visible')) {
-      hideFeedbackPopup();
-      disableFeedbackMode();
-    } else if (feedbackMode) {
-      disableFeedbackMode();
-    }
-  }
-});
-
-// Click outside popup to close
-document.addEventListener('click', (e) => {
-  if (feedbackPopup.classList.contains('visible') &&
-      !feedbackPopup.contains(e.target) &&
-      e.target !== feedbackBtn) {
-    hideFeedbackPopup();
-    disableFeedbackMode();
-  }
-});
-
-// Enter key in textarea to submit
 feedbackText.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
@@ -1020,117 +1213,243 @@ feedbackText.addEventListener('keydown', (e) => {
   }
 });
 
-// Handle console messages from webview (element selected)
-function setupWebviewConsoleListener(webview) {
-  webview.addEventListener('console-message', (e) => {
-    if (e.message && e.message.startsWith('__JANUS_ELEMENT_SELECTED__:')) {
-      const jsonStr = e.message.replace('__JANUS_ELEMENT_SELECTED__:', '');
-      try {
-        selectedElementData = JSON.parse(jsonStr);
+// Click outside popup to close
+document.addEventListener('click', (e) => {
+  if (feedbackPopup.classList.contains('visible') &&
+      !feedbackPopup.contains(e.target)) {
+    hideFeedbackPopup();
+    disableFeedbackMode();
+  }
+});
 
-        // Convert screen coordinates to window coordinates
-        const rect = webview.getBoundingClientRect();
-        const x = selectedElementData.screenX - window.screenX;
-        const y = selectedElementData.screenY - window.screenY;
 
-        showFeedbackPopup(x, y);
-      } catch (err) {
-        console.error('Failed to parse element data:', err);
-        disableFeedbackMode();
+// ===== DRAG AND DROP =====
+let dragCounter = 0;
+
+document.addEventListener('dragenter', (e) => {
+  e.preventDefault();
+  if (e.dataTransfer.types.includes('Files')) {
+    dragCounter++;
+    if (dragCounter === 1) {
+      dropOverlay.classList.add('visible');
+      disableWebviewPointerEvents();
+    }
+  }
+});
+
+document.addEventListener('dragleave', (e) => {
+  e.preventDefault();
+  dragCounter--;
+  if (dragCounter <= 0) {
+    dragCounter = 0;
+    dropOverlay.classList.remove('visible');
+    enableWebviewPointerEvents();
+  }
+});
+
+document.addEventListener('dragover', (e) => {
+  e.preventDefault();
+});
+
+dropOverlay.addEventListener('drop', (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  dragCounter = 0;
+  dropOverlay.classList.remove('visible');
+  enableWebviewPointerEvents();
+
+  const files = e.dataTransfer.files;
+  if (files.length > 0) {
+    const file = files[0];
+    const filePath = file.path;
+    if (filePath) {
+      const activeTab = activeTabId ? tabs.get(activeTabId) : null;
+
+      if (activeTab && activeTab.type === 'terminal') {
+        const escapedPath = filePath.replace(/([ "'\\$`!])/g, '\\$1');
+        window.electronAPI.sendTerminalInput(activeTab.typeState.ptyId, escapedPath);
+      } else {
+        const fileUrl = 'file://' + filePath;
+        if (activeTab && activeTab.type === 'web') {
+          activeTab.typeState.urlInput.value = fileUrl;
+          activeTab.typeState.webview.src = fileUrl;
+        }
       }
     }
-  });
+  }
+});
+
+document.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dragCounter = 0;
+  dropOverlay.classList.remove('visible');
+  enableWebviewPointerEvents();
+});
+
+
+// ===== CROSS-PANEL HELPERS =====
+
+// Find or create a cumulus tab and return its ID
+function getOrCreateCumulusTab() {
+  // Find existing cumulus tab
+  for (const [id, tab] of tabs) {
+    if (tab.type === 'cumulus') {
+      return id;
+    }
+  }
+  // Create new one
+  return createCumulusTab();
 }
 
-// Setup listener for existing initial browser tab
-setTimeout(() => {
-  for (const [id, browserInfo] of browsers) {
-    setupWebviewConsoleListener(browserInfo.webview);
+// Extract last N lines of text from a terminal buffer
+function extractTerminalText(term, lineCount = 50) {
+  const buffer = term.buffer.active;
+  const totalLines = buffer.length;
+  const start = Math.max(0, totalLines - lineCount);
+  const lines = [];
+  for (let i = start; i < totalLines; i++) {
+    const line = buffer.getLine(i);
+    if (line) {
+      lines.push(line.translateToString(true));
+    }
   }
-}, 100);
-
-// Override createBrowserTab to add listener to new tabs
-const originalCreateBrowserTab = createBrowserTab;
-createBrowserTab = function(url) {
-  const id = originalCreateBrowserTab(url);
-  const browserInfo = browsers.get(id);
-  if (browserInfo) {
-    setupWebviewConsoleListener(browserInfo.webview);
+  // Trim trailing empty lines
+  while (lines.length > 0 && lines[lines.length - 1].trim() === '') {
+    lines.pop();
   }
-  return id;
-};
-
-
-// ===== STARTUP: PROJECT FOLDER SELECTION =====
-async function initProjectFolder() {
-  const existingPath = await window.electronAPI.getProjectPath();
-  if (!existingPath) {
-    await window.electronAPI.selectProjectFolder();
-  }
-  // Create initial terminal after project folder is set
-  createTab();
+  return lines.join('\n');
 }
 
-// Initialize on load
-initProjectFolder();
+// Send text to a cumulus tab's input (via IPC as a message)
+function sendToCumulusChat(text) {
+  const cumulusId = getOrCreateCumulusTab();
+  const cumulusTab = tabs.get(cumulusId);
+  if (!cumulusTab) return;
+
+  // Make the cumulus tab visible and active
+  if (!cumulusTab.visible) {
+    toggleTabVisibility(cumulusId);
+  }
+  activateTab(cumulusId);
+
+  // Send message via IPC
+  const threadName = cumulusTab.typeState.threadName;
+  if (threadName) {
+    window.electronAPI.cumulusSendMessage(threadName, text);
+  }
+}
 
 
 // ===== KEYBOARD SHORTCUTS =====
 document.addEventListener('keydown', (e) => {
-  // Cmd+R (Mac) or Ctrl+R (Windows/Linux) - Reload active browser tab only
-  if ((e.metaKey || e.ctrlKey) && e.key === 'r') {
-    e.preventDefault();
-    const browser = getActiveBrowser();
-    if (browser) {
-      browser.reload();
+  // ESC: close type picker / feedback popup / feedback mode
+  if (e.key === 'Escape') {
+    if (tabTypePicker.classList.contains('visible')) {
+      tabTypePicker.classList.remove('visible');
+      return;
+    }
+    if (feedbackPopup.classList.contains('visible')) {
+      hideFeedbackPopup();
+      disableFeedbackMode();
+      return;
+    }
+    if (feedbackMode) {
+      disableFeedbackMode();
+      return;
     }
   }
 
-  // Terminal zoom shortcuts (Cmd/Ctrl + and Cmd/Ctrl -)
+  // Cmd+Shift+C: Send terminal output to chat
+  if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === 'C') {
+    if (activeTabId) {
+      const tab = tabs.get(activeTabId);
+      if (tab && tab.type === 'terminal') {
+        e.preventDefault();
+        const terminalOutput = extractTerminalText(tab.typeState.term, 50);
+        if (terminalOutput.trim()) {
+          sendToCumulusChat(`Here is recent terminal output:\n\n\`\`\`\n${terminalOutput}\n\`\`\`\n\nPlease help me understand or fix any issues.`);
+        }
+      }
+    }
+  }
+
+  // Cmd+Shift+S: Send browser screenshot to chat
+  if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === 'S') {
+    if (activeTabId) {
+      const tab = tabs.get(activeTabId);
+      if (tab && tab.type === 'web') {
+        e.preventDefault();
+        const url = tab.typeState.webview.getURL();
+        sendToCumulusChat(`I'm looking at the page: ${url}\n\nPlease help me with this page.`);
+      }
+    }
+  }
+
+  // Cmd+R: reload active web tab
+  if ((e.metaKey || e.ctrlKey) && !e.shiftKey && e.key === 'r') {
+    const webview = getActiveWebview();
+    if (webview) {
+      e.preventDefault();
+      webview.reload();
+    }
+  }
+
+  // Cmd+= or Cmd++: zoom in terminals
   if ((e.metaKey || e.ctrlKey) && (e.key === '=' || e.key === '+')) {
     e.preventDefault();
     zoomInTerminal();
   }
+
+  // Cmd+-: zoom out terminals
   if ((e.metaKey || e.ctrlKey) && e.key === '-') {
     e.preventDefault();
     zoomOutTerminal();
   }
 
-  // Toggle browser panel (Cmd/Ctrl + \)
-  if ((e.metaKey || e.ctrlKey) && e.key === '\\') {
-    e.preventDefault();
-    toggleBrowserPanel();
+  // Cmd+1..9: solo select tab N
+  if ((e.metaKey || e.ctrlKey) && e.key >= '1' && e.key <= '9') {
+    const n = parseInt(e.key, 10);
+    const tabList = [...tabs.values()];
+    if (n <= tabList.length) {
+      e.preventDefault();
+      soloSelectTab(tabList[n - 1].id);
+    }
   }
 });
 
 
-// ===== PANE SELECTION CLICK HANDLERS =====
-document.getElementById('browser-panel').addEventListener('click', (e) => {
-  // Don't select browser pane if clicking on divider resize handle
-  if (!e.target.closest('#divider')) {
-    selectPane('browser');
+// ===== IMAGE PASTE HANDLER =====
+window.electronAPI.onPasteImage(() => {
+  if (!activeTabId) return;
+  const tab = tabs.get(activeTabId);
+  if (tab && tab.type === 'terminal') {
+    window.electronAPI.sendTerminalInput(tab.typeState.ptyId, '\x16');
   }
-});
-
-document.getElementById('terminal-panel').addEventListener('click', () => {
-  selectPane('terminal');
-});
-
-// Also select terminal pane when terminal receives focus (keyboard navigation)
-terminalsContainer.addEventListener('focusin', () => {
-  selectPane('terminal');
 });
 
 
 // ===== CLOSE TAB HANDLER =====
 window.electronAPI.onCloseTab(() => {
-  if (selectedPane === 'browser') {
-    if (activeBrowserId) {
-      closeBrowserTab(activeBrowserId);
-    }
-  } else {
-    if (activeTerminalId) {
-      closeTab(activeTerminalId);
-    }
+  if (activeTabId) {
+    closeTab(activeTabId);
   }
 });
+
+
+// ===== NEW TAB HANDLER (from menu Cmd+T) =====
+window.electronAPI.onNewTab(() => {
+  createTerminalTab();
+});
+
+
+// ===== STARTUP =====
+async function initProjectFolder() {
+  const existingPath = await window.electronAPI.getProjectPath();
+  if (!existingPath) {
+    await window.electronAPI.selectProjectFolder();
+  }
+  // Create initial terminal tab after project folder is set
+  createTerminalTab();
+}
+
+initProjectFolder();

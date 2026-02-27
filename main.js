@@ -1,10 +1,14 @@
-const { app, BrowserWindow, ipcMain, dialog, session, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, session, Menu, clipboard } = require('electron');
 const path = require('path');
 const pty = require('node-pty');
+const { COLOR_PALETTE, getProjectColor, getProjectColorId, setProjectColor, getColorHex } = require('./projectColors');
+const { CumulusBridge } = require('./cumulus-bridge');
 
 const windows = new Set();
 // Map PTY processes by window ID and terminal ID: windowId -> Map(terminalId -> ptyProcess)
 const windowPtyProcesses = new Map();
+// Map window ID -> CumulusBridge instance
+const windowBridges = new Map();
 let nextTerminalId = 1;
 
 function updateWindowTitle(win) {
@@ -17,10 +21,15 @@ function updateWindowTitle(win) {
 }
 
 function createWindow(projectPath = null) {
+  const titleBarColor = getProjectColor(projectPath);
+
   const win = new BrowserWindow({
     width: 1400,
     height: 900,
     title: 'Janus',
+    titleBarStyle: 'hiddenInset',
+    trafficLightPosition: { x: 12, y: 12 },
+    backgroundColor: titleBarColor,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       nodeIntegration: false,
@@ -38,6 +47,11 @@ function createWindow(projectPath = null) {
   // Initialize PTY map for this window
   windowPtyProcesses.set(win.id, new Map());
 
+  // Initialize Cumulus bridge for this window
+  const bridge = new CumulusBridge(projectPath);
+  bridge.initialize().catch(err => console.error('[Cumulus] Init error:', err));
+  windowBridges.set(win.id, bridge);
+
   win.loadFile('index.html');
 
   win.on('closed', () => {
@@ -48,6 +62,12 @@ function createWindow(projectPath = null) {
         ptyProcess.kill();
       }
       windowPtyProcesses.delete(win.id);
+    }
+    // Destroy Cumulus bridge for this window
+    const bridge = windowBridges.get(win.id);
+    if (bridge) {
+      bridge.destroy();
+      windowBridges.delete(win.id);
     }
     windows.delete(win);
   });
@@ -68,9 +88,21 @@ function createTerminal(win, cwd = null) {
     env: process.env
   });
 
+  // Batch PTY output to reduce IPC frequency during rapid streaming
+  // (e.g., LLM token-by-token output). Flushes every 16ms (~60fps).
+  let pendingData = '';
+  let flushTimer = null;
+
   ptyProcess.onData((data) => {
-    if (win && !win.isDestroyed()) {
-      win.webContents.send('terminal-data', { id, data });
+    pendingData += data;
+    if (!flushTimer) {
+      flushTimer = setTimeout(() => {
+        flushTimer = null;
+        if (win && !win.isDestroyed()) {
+          win.webContents.send('terminal-data', { id, data: pendingData });
+        }
+        pendingData = '';
+      }, 16);
     }
   });
 
@@ -102,18 +134,35 @@ ipcMain.handle('get-project-path', (event) => {
   return win ? win.projectPath : null;
 });
 
+// Get title bar info (color and title)
+ipcMain.handle('get-title-bar-info', (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win) return null;
+
+  const color = getProjectColor(win.projectPath);
+  const title = win.projectPath ? `Janus – ${path.basename(win.projectPath)}` : 'Janus';
+  return { color, title };
+});
+
 // Select project folder
 ipcMain.handle('select-project-folder', async (event) => {
   const win = BrowserWindow.fromWebContents(event.sender);
   if (!win) return null;
 
   const result = await dialog.showOpenDialog(win, {
-    properties: ['openDirectory'],
+    properties: ['openDirectory', 'createDirectory'],
     title: 'Select Project Folder'
   });
   if (!result.canceled && result.filePaths.length > 0) {
     win.projectPath = result.filePaths[0];
+    // Update the Cumulus bridge so chat tabs use the correct project path
+    const bridge = windowBridges.get(win.id);
+    if (bridge) bridge.projectPath = win.projectPath;
     updateWindowTitle(win);
+    // Notify renderer of title bar update
+    const newColor = getProjectColor(win.projectPath);
+    const title = `Janus – ${path.basename(win.projectPath)}`;
+    win.webContents.send('title-bar-update', { color: newColor, title });
     return win.projectPath;
   }
   return null;
@@ -154,6 +203,74 @@ ipcMain.on('terminal-resize', (event, { id, cols, rows }) => {
   }
 });
 
+// ===== CUMULUS IPC HANDLERS =====
+
+// Helper to get bridge for a window
+function getBridge(event) {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win) return null;
+  return windowBridges.get(win.id) || null;
+}
+
+// Create/open a thread
+ipcMain.handle('cumulus:create-thread', async (event, threadName) => {
+  const bridge = getBridge(event);
+  if (!bridge) return null;
+  await bridge.getOrCreateThread(threadName);
+  return { threadName };
+});
+
+// Send message and stream response
+ipcMain.handle('cumulus:send-message', async (event, threadName, message) => {
+  const bridge = getBridge(event);
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!bridge || !win) return null;
+  return bridge.sendMessage(threadName, message, win);
+});
+
+// Kill running Claude process for a thread
+ipcMain.on('cumulus:kill', (event, threadName) => {
+  const bridge = getBridge(event);
+  if (bridge) bridge.killProcess(threadName);
+});
+
+// Get message history
+ipcMain.handle('cumulus:get-history', async (event, threadName, count) => {
+  const bridge = getBridge(event);
+  if (!bridge) return [];
+  return bridge.getHistory(threadName, count);
+});
+
+// List available threads
+ipcMain.handle('cumulus:list-threads', async (event) => {
+  const bridge = getBridge(event);
+  if (!bridge) return [];
+  return bridge.listThreads();
+});
+
+// Build project color submenu items
+function buildProjectColorSubmenu() {
+  const focusedWindow = BrowserWindow.getFocusedWindow();
+  const currentColorId = focusedWindow && focusedWindow.projectPath
+    ? getProjectColorId(focusedWindow.projectPath)
+    : null;
+
+  return COLOR_PALETTE.map(color => ({
+    label: color.name,
+    type: 'checkbox',
+    checked: color.id === currentColorId,
+    click: () => {
+      const win = BrowserWindow.getFocusedWindow();
+      if (win && win.projectPath) {
+        setProjectColor(win.projectPath, color.id);
+        // Send update to renderer to change title bar color
+        const title = `Janus – ${path.basename(win.projectPath)}`;
+        win.webContents.send('title-bar-update', { color: color.hex, title });
+      }
+    }
+  }));
+}
+
 // Create application menu
 function createMenu() {
   const isMac = process.platform === 'darwin';
@@ -183,7 +300,7 @@ function createMenu() {
           accelerator: 'CmdOrCtrl+N',
           click: async () => {
             const result = await dialog.showOpenDialog({
-              properties: ['openDirectory'],
+              properties: ['openDirectory', 'createDirectory'],
               title: 'Select Project Folder'
             });
             if (!result.canceled && result.filePaths.length > 0) {
@@ -192,19 +309,98 @@ function createMenu() {
           }
         },
         { type: 'separator' },
-        isMac ? { role: 'close' } : { role: 'quit' }
+        {
+          label: 'New Tab',
+          accelerator: 'CmdOrCtrl+T',
+          click: () => {
+            const win = BrowserWindow.getFocusedWindow();
+            if (win) {
+              win.webContents.send('new-tab');
+            }
+          }
+        },
+        { type: 'separator' },
+        {
+          label: 'Close Tab',
+          accelerator: 'CmdOrCtrl+W',
+          click: () => {
+            const win = BrowserWindow.getFocusedWindow();
+            if (win) {
+              win.webContents.send('close-tab');
+            }
+          }
+        },
+        ...(isMac ? [] : [{ role: 'quit' }])
       ]
     },
-    // Edit menu
-    { role: 'editMenu' },
+    // Edit menu (custom paste to support image paste in terminal apps)
+    {
+      label: 'Edit',
+      submenu: [
+        { role: 'undo' },
+        { role: 'redo' },
+        { type: 'separator' },
+        { role: 'cut' },
+        { role: 'copy' },
+        {
+          label: 'Paste',
+          accelerator: 'CmdOrCtrl+V',
+          click: () => {
+            const win = BrowserWindow.getFocusedWindow();
+            if (!win) return;
+
+            // Check if clipboard has image data but no text
+            // (e.g. screenshot, copied image). In that case, send raw Ctrl+V
+            // to the terminal so Ink-based apps (cumulus, claude) can detect
+            // it via useInput and read the clipboard image themselves.
+            const image = clipboard.readImage();
+            const text = clipboard.readText();
+            if (!image.isEmpty() && !text.trim()) {
+              win.webContents.send('paste-image');
+            } else {
+              win.webContents.paste();
+            }
+          }
+        },
+        { role: 'pasteAndMatchStyle' },
+        { role: 'delete' },
+        { role: 'selectAll' },
+      ]
+    },
     // View menu
     { role: 'viewMenu' },
     // Window menu
-    { role: 'windowMenu' }
+    {
+      label: 'Window',
+      submenu: [
+        { role: 'minimize' },
+        { role: 'zoom' },
+        { type: 'separator' },
+        {
+          label: 'Project Color',
+          submenu: buildProjectColorSubmenu()
+        },
+        { type: 'separator' },
+        ...(isMac ? [
+          { role: 'front' },
+          { type: 'separator' },
+          { role: 'window' }
+        ] : [
+          { role: 'close' }
+        ])
+      ]
+    }
   ];
 
   const menu = Menu.buildFromTemplate(template);
   Menu.setApplicationMenu(menu);
+}
+
+// Update menu when window focus changes (to refresh color checkmarks)
+function setupMenuRefresh() {
+  app.on('browser-window-focus', () => {
+    createMenu();
+  });
 }
 
 // Enable remote debugging for Playwright
@@ -255,6 +451,7 @@ app.whenReady().then(() => {
   });
 
   createMenu();
+  setupMenuRefresh();
   createWindow();
 });
 
