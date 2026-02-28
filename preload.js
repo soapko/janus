@@ -23,9 +23,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Paste image signal (Cmd+V with image on clipboard)
   onPasteImage: (callback) => ipcRenderer.on('paste-image', () => callback()),
 
+  // Attachments
+  saveClipboardImage: () => ipcRenderer.invoke('clipboard:save-image'),
+  pickFiles: () => ipcRenderer.invoke('dialog:pick-files'),
+
   // Cumulus chat
   cumulusCreateThread: (name) => ipcRenderer.invoke('cumulus:create-thread', name),
-  cumulusSendMessage: (thread, message) => ipcRenderer.invoke('cumulus:send-message', thread, message),
+  cumulusSendMessage: (thread, message, attachments) => ipcRenderer.invoke('cumulus:send-message', thread, message, attachments),
   cumulusKill: (thread) => ipcRenderer.send('cumulus:kill', thread),
   cumulusGetHistory: (thread, count) => ipcRenderer.invoke('cumulus:get-history', thread, count),
   cumulusListThreads: () => ipcRenderer.invoke('cumulus:list-threads'),

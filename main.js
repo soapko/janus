@@ -1,5 +1,7 @@
 const { app, BrowserWindow, ipcMain, dialog, session, Menu, clipboard } = require('electron');
 const path = require('path');
+const fs = require('fs');
+const os = require('os');
 const pty = require('node-pty');
 const { COLOR_PALETTE, getProjectColor, getProjectColorId, setProjectColor, getColorHex } = require('./projectColors');
 const { CumulusBridge } = require('./cumulus-bridge');
@@ -221,11 +223,11 @@ ipcMain.handle('cumulus:create-thread', async (event, threadName) => {
 });
 
 // Send message and stream response
-ipcMain.handle('cumulus:send-message', async (event, threadName, message) => {
+ipcMain.handle('cumulus:send-message', async (event, threadName, message, attachments) => {
   const bridge = getBridge(event);
   const win = BrowserWindow.fromWebContents(event.sender);
   if (!bridge || !win) return null;
-  return bridge.sendMessage(threadName, message, win);
+  return bridge.sendMessage(threadName, message, win, attachments);
 });
 
 // Kill running Claude process for a thread
@@ -246,6 +248,54 @@ ipcMain.handle('cumulus:list-threads', async (event) => {
   const bridge = getBridge(event);
   if (!bridge) return [];
   return bridge.listThreads();
+});
+
+// ===== ATTACHMENT IPC HANDLERS =====
+
+const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg']);
+const ATTACHMENT_DIR = path.join(os.tmpdir(), 'janus-attachments');
+
+function ensureAttachmentDir() {
+  if (!fs.existsSync(ATTACHMENT_DIR)) {
+    fs.mkdirSync(ATTACHMENT_DIR, { recursive: true });
+  }
+}
+
+// Save clipboard image to temp file
+ipcMain.handle('clipboard:save-image', async () => {
+  const image = clipboard.readImage();
+  if (image.isEmpty()) return null;
+
+  ensureAttachmentDir();
+  const id = `clip-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const filename = `${id}.png`;
+  const filePath = path.join(ATTACHMENT_DIR, filename);
+  fs.writeFileSync(filePath, image.toPNG());
+
+  return { id, name: filename, path: filePath, type: 'image', mimeType: 'image/png' };
+});
+
+// Open file picker and return attachment objects
+ipcMain.handle('dialog:pick-files', async (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win) return [];
+
+  const result = await dialog.showOpenDialog(win, {
+    properties: ['openFile', 'multiSelections'],
+    title: 'Attach Files',
+  });
+
+  if (result.canceled || result.filePaths.length === 0) return [];
+
+  return result.filePaths.map(filePath => {
+    const ext = path.extname(filePath).toLowerCase();
+    const isImage = IMAGE_EXTENSIONS.has(ext);
+    const mimeType = isImage
+      ? `image/${ext === '.jpg' ? 'jpeg' : ext.slice(1)}`
+      : 'application/octet-stream';
+    const id = `file-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    return { id, name: path.basename(filePath), path: filePath, type: isImage ? 'image' : 'file', mimeType };
+  });
 });
 
 // Build project color submenu items

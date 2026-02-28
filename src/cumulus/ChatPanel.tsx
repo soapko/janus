@@ -1,5 +1,5 @@
 import React, { Component, useCallback, useEffect, useRef, useState } from 'react';
-import { CumulusChatAPI, Message } from './types';
+import { Attachment, CumulusChatAPI, Message } from './types';
 import ChatInput from './ChatInput';
 import MessageBubble from './MessageBubble';
 import StreamingResponse from './StreamingResponse';
@@ -110,6 +110,7 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
           const optimisticIdx = prev.findIndex((m) => m.id.startsWith('_opt_') && m.role === 'user');
           if (optimisticIdx !== -1) {
             const next = [...prev];
+            // Authoritative message from HistoryStore now carries persisted attachments.
             next[optimisticIdx] = data.message;
             return next;
           }
@@ -222,17 +223,16 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
   }, [api, scrollToBottom]);
 
   const handleSend = useCallback(
-    (text: string) => {
+    (text: string, attachments: Attachment[]) => {
       setError(null);
-      api.sendMessage(text);
+      api.sendMessage(text, attachments);
       // Optimistically add the user message so the UI feels responsive.
-      // The authoritative message will arrive via onMessage; deduplication
-      // by id in the onMessage handler prevents doubles.
       const optimistic: Message = {
         id: `_opt_${Date.now()}`, // temporary id, replaced by authoritative message
         role: 'user',
         content: text,
         timestamp: Date.now(),
+        attachments: attachments.length > 0 ? attachments : undefined,
       };
       setMessages((prev) => [...prev, optimistic]);
       scrollToBottom();
@@ -318,6 +318,8 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
       <ChatInput
         onSend={handleSend}
         onKill={handleKill}
+        onSaveClipboardImage={api.saveClipboardImage}
+        onPickFiles={api.pickFiles}
         disabled={isLoading}
         isStreaming={isStreaming}
       />

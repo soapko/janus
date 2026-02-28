@@ -193,6 +193,23 @@ function extractTextFromStreamLine(line) {
   }
 }
 
+/**
+ * Map cumulus Attachment shape (storedPath) to Janus renderer shape (path).
+ */
+function mapMessageForRenderer(msg) {
+  if (!msg || !msg.attachments?.length) return msg;
+  return {
+    ...msg,
+    attachments: msg.attachments.map(att => ({
+      id: att.name,
+      name: att.name,
+      path: att.storedPath,
+      type: att.type,
+      mimeType: att.mimeType,
+    })),
+  };
+}
+
 class CumulusBridge {
   constructor(projectPath) {
     this.projectPath = projectPath;
@@ -227,35 +244,88 @@ class CumulusBridge {
     return thread;
   }
 
-  async sendMessage(threadName, messageText, win) {
+  async sendMessage(threadName, messageText, win, attachments = []) {
     const lib = await loadCumulus();
     const thread = await this.getOrCreateThread(threadName);
+
+    // Build image content blocks for multimodal messages
+    const imageBlocks = [];
+    let messageForClaude = messageText;
+
+    if (attachments && attachments.length > 0) {
+      const fileRefs = [];
+      for (const att of attachments) {
+        if (att.type === 'image' && att.path) {
+          try {
+            const data = fs.readFileSync(att.path);
+            const base64 = data.toString('base64');
+            const ext = path.extname(att.path).toLowerCase().replace('.', '');
+            const mimeMap = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp' };
+            const mediaType = att.mimeType || mimeMap[ext] || 'image/png';
+            imageBlocks.push({
+              type: 'image',
+              source: { type: 'base64', media_type: mediaType, data: base64 },
+            });
+          } catch (err) {
+            console.error('[CumulusBridge] Failed to read image:', att.path, err);
+            fileRefs.push(`[Attached image (unreadable): ${att.path}]`);
+          }
+        } else {
+          fileRefs.push(`[Attached file: ${att.path}]`);
+        }
+      }
+      if (fileRefs.length > 0) {
+        messageForClaude = messageForClaude
+          ? messageForClaude + '\n\n' + fileRefs.join('\n')
+          : fileRefs.join('\n');
+      }
+    }
+
+    const hasImages = imageBlocks.length > 0;
 
     // Create fresh budget
     const budget = new lib.ContextBudget();
 
     // Check if user input should be externalized
-    let messageForClaude = messageText;
-    if (lib.shouldExternalizeUserInput && lib.shouldExternalizeUserInput(messageText, budget)) {
-      const { replacement } = await lib.externalizeUserInput(messageText, thread.content);
+    if (lib.shouldExternalizeUserInput && lib.shouldExternalizeUserInput(messageForClaude, budget)) {
+      const { replacement } = await lib.externalizeUserInput(messageForClaude, thread.content);
       messageForClaude = replacement;
     } else {
-      budget.consume(lib.estimateTokens(messageText));
+      budget.consume(lib.estimateTokens(messageForClaude));
     }
 
-    // Save user message to history
-    const userMessage = await thread.history.append({
+    // Save user message to history (attachments get copied to persistent storage by cumulus)
+    let userMessage = await thread.history.append({
       role: 'user',
       content: messageText,
       metadata: {
         sessionId: thread.session.getSessionId(),
       },
+      attachments: attachments.length > 0 ? attachments.map(att => ({
+        name: att.name,
+        type: att.type,
+        mimeType: att.mimeType,
+        storedPath: att.path, // Janus uses `path`, cumulus expects `storedPath`
+      })) : undefined,
     });
 
-    // Send user message back to renderer
+    // Resolve relative storedPaths to absolute (append() returns relative,
+    // resolveAttachmentPaths only runs on getAll/getRecent)
+    if (userMessage.attachments?.length) {
+      const threadDir = path.dirname(thread.threadPath);
+      userMessage = {
+        ...userMessage,
+        attachments: userMessage.attachments.map(att => ({
+          ...att,
+          storedPath: path.isAbsolute(att.storedPath) ? att.storedPath : path.join(threadDir, att.storedPath),
+        })),
+      };
+    }
+
+    // Send user message back to renderer (map storedPath -> path for frontend)
     win.webContents.send('cumulus:message', {
       threadName,
-      message: userMessage,
+      message: mapMessageForRenderer(userMessage),
     });
 
     // Get stats
@@ -322,8 +392,15 @@ class CumulusBridge {
       '--permission-mode', 'bypassPermissions',
       '--mcp-config', thread.mcpConfigPath,
       '--append-system-prompt', systemPrompt,
-      messageForClaude,
     ];
+
+    if (hasImages) {
+      // Multimodal: pipe content blocks via stdin
+      args.push('--input-format', 'stream-json');
+    } else {
+      // Text-only: pass as positional argument
+      args.push(messageForClaude);
+    }
 
     // Filter out Claude env vars
     const cleanEnv = Object.fromEntries(
@@ -335,10 +412,24 @@ class CumulusBridge {
     const claudePath = resolveClaudeCli();
     const cwd = this.projectPath || os.homedir();
     const claude = spawn(claudePath, args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [hasImages ? 'pipe' : 'ignore', 'pipe', 'pipe'],
       env: cleanEnv,
       cwd,
     });
+
+    // For multimodal messages, write content blocks to stdin
+    if (hasImages && claude.stdin) {
+      const contentBlocks = [
+        ...imageBlocks,
+        { type: 'text', text: messageForClaude || '' },
+      ];
+      const payload = JSON.stringify({
+        type: 'user',
+        message: { role: 'user', content: contentBlocks },
+      });
+      claude.stdin.write(payload + '\n');
+      claude.stdin.end();
+    }
 
     this.activeProcesses.set(threadName, claude);
 
@@ -479,10 +570,10 @@ class CumulusBridge {
 
   async getHistory(threadName, count = 50) {
     const thread = await this.getOrCreateThread(threadName);
-    if (count <= 0) {
-      return thread.history.getAll();
-    }
-    return thread.history.getRecent(count);
+    const messages = count <= 0
+      ? await thread.history.getAll()
+      : await thread.history.getRecent(count);
+    return messages.map(mapMessageForRenderer);
   }
 
   async listThreads() {

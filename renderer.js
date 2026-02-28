@@ -541,11 +541,13 @@ function mountCumulusReact(tab, container, threadName) {
 
   window.electronAPI.cumulusCreateThread(threadName).then(() => {
     const api = {
-      sendMessage: (msg) => window.electronAPI.cumulusSendMessage(threadName, msg),
+      sendMessage: (msg, attachments) => window.electronAPI.cumulusSendMessage(threadName, msg, attachments),
       kill: () => window.electronAPI.cumulusKill(threadName),
       getHistory: (count) => window.electronAPI.cumulusGetHistory(threadName, count),
       listThreads: () => window.electronAPI.cumulusListThreads(),
       threadName,
+      saveClipboardImage: () => window.electronAPI.saveClipboardImage(),
+      pickFiles: () => window.electronAPI.pickFiles(),
       onMessage: (cb) => window.electronAPI.onCumulusMessage(cb),
       onStreamChunk: (cb) => window.electronAPI.onCumulusStreamChunk(cb),
       onStreamEnd: (cb) => window.electronAPI.onCumulusStreamEnd(cb),
@@ -1424,6 +1426,8 @@ window.electronAPI.onPasteImage(() => {
   const tab = tabs.get(activeTabId);
   if (tab && tab.type === 'terminal') {
     window.electronAPI.sendTerminalInput(tab.typeState.ptyId, '\x16');
+  } else if (tab && tab.type === 'cumulus') {
+    tab.typeState.container.dispatchEvent(new CustomEvent('janus-paste-image', { bubbles: true }));
   }
 });
 
