@@ -24,6 +24,9 @@ const terminalFollowBottom = new Map();
 // Resize handle drag state
 let resizeDragState = null;
 
+// Tab drag-to-reorder state
+let draggedTabId = null;
+
 // Feedback state
 let feedbackMode = false;
 let selectedElementData = null;
@@ -68,6 +71,7 @@ function buildTabEl(tab) {
   const el = document.createElement('div');
   el.className = 'tab';
   el.dataset.tabId = tab.id;
+  el.draggable = true;
 
   const dot = document.createElement('span');
   dot.className = `tab-type-dot ${tab.type}`;
@@ -96,7 +100,81 @@ function buildTabEl(tab) {
     }
   });
 
+  // Drag-to-reorder
+  el.addEventListener('dragstart', (e) => {
+    draggedTabId = tab.id;
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', String(tab.id));
+    el.classList.add('tab-dragging');
+  });
+
+  el.addEventListener('dragend', () => {
+    el.classList.remove('tab-dragging');
+    draggedTabId = null;
+    tabBar.querySelectorAll('.tab').forEach(t => {
+      t.classList.remove('tab-drag-over-left', 'tab-drag-over-right');
+    });
+  });
+
+  el.addEventListener('dragover', (e) => {
+    if (draggedTabId === null || draggedTabId === tab.id) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+
+    // Show drop indicator on left or right side
+    const rect = el.getBoundingClientRect();
+    const midX = rect.left + rect.width / 2;
+    el.classList.toggle('tab-drag-over-left', e.clientX < midX);
+    el.classList.toggle('tab-drag-over-right', e.clientX >= midX);
+  });
+
+  el.addEventListener('dragleave', () => {
+    el.classList.remove('tab-drag-over-left', 'tab-drag-over-right');
+  });
+
+  el.addEventListener('drop', (e) => {
+    e.preventDefault();
+    el.classList.remove('tab-drag-over-left', 'tab-drag-over-right');
+    if (draggedTabId === null || draggedTabId === tab.id) return;
+
+    const draggedTab = tabs.get(draggedTabId);
+    if (!draggedTab) return;
+
+    // Determine position: before or after this tab
+    const rect = el.getBoundingClientRect();
+    const midX = rect.left + rect.width / 2;
+    const insertBefore = e.clientX < midX;
+
+    // Move DOM element in tab bar
+    if (insertBefore) {
+      tabBar.insertBefore(draggedTab.tabEl, el);
+    } else {
+      const next = el.nextSibling;
+      tabBar.insertBefore(draggedTab.tabEl, next);
+    }
+
+    // Rebuild Map order to match DOM order
+    rebuildTabOrder();
+    rebuildPanelLayout();
+  });
+
   return el;
+}
+
+
+// ===== REBUILD TAB MAP ORDER (from DOM) =====
+function rebuildTabOrder() {
+  const tabEls = tabBar.querySelectorAll('.tab[data-tab-id]');
+  const ordered = [];
+  tabEls.forEach(el => {
+    const id = parseInt(el.dataset.tabId, 10);
+    const tab = tabs.get(id);
+    if (tab) ordered.push([id, tab]);
+  });
+  tabs.clear();
+  for (const [id, tab] of ordered) {
+    tabs.set(id, tab);
+  }
 }
 
 
@@ -1452,8 +1530,8 @@ async function initProjectFolder() {
   if (!existingPath) {
     await window.electronAPI.selectProjectFolder();
   }
-  // Create initial terminal tab after project folder is set
-  createTerminalTab();
+  // Create initial chat tab after project folder is set
+  createCumulusTab();
 }
 
 initProjectFolder();
