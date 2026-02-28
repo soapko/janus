@@ -3,6 +3,8 @@ import { Attachment, CumulusChatAPI, Message } from './types';
 import ChatInput from './ChatInput';
 import MessageBubble from './MessageBubble';
 import StreamingResponse from './StreamingResponse';
+import IncludeOverlay from './IncludeOverlay';
+import RevertOverlay from './RevertOverlay';
 
 // Error boundary to prevent a single message render crash from wiping the whole panel
 class MessageErrorBoundary extends Component<
@@ -35,6 +37,8 @@ class MessageErrorBoundary extends Component<
   }
 }
 
+type OverlayMode = 'include' | 'revert' | null;
+
 interface ChatPanelProps {
   api: CumulusChatAPI;
 }
@@ -47,17 +51,29 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
   const [isLoading, setIsLoading] = useState(true);
   const [threads, setThreads] = useState<string[]>([]);
   const [showThreadPicker, setShowThreadPicker] = useState(false);
+  const [overlay, setOverlay] = useState<OverlayMode>(null);
 
   const scrollAnchorRef = useRef<HTMLDivElement>(null);
   const messageListRef = useRef<HTMLDivElement>(null);
   const streamBufferRef = useRef('');
 
   const scrollToBottom = useCallback(() => {
-    // Use requestAnimationFrame to ensure the DOM has updated before scrolling
     requestAnimationFrame(() => {
       scrollAnchorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
     });
   }, []);
+
+  const loadHistory = useCallback(async () => {
+    try {
+      const history = await api.getHistory(50);
+      const filtered = history.filter((m) => m.role !== 'session');
+      setMessages(filtered);
+      scrollToBottom();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setError(`Failed to load history: ${message}`);
+    }
+  }, [api, scrollToBottom]);
 
   // Load history on mount
   useEffect(() => {
@@ -88,8 +104,6 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
   useEffect(() => {
     const { threadName } = api;
 
-    // Each on* call registers a new listener. We track unsubscribe functions
-    // if the API returns them (common in Electron IPC wrappers).
     const unsubscribeFns: Array<() => void> = [];
 
     const tryRegisterCleanup = (result: unknown) => {
@@ -105,12 +119,10 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
       setMessages((prev) => {
         const exists = prev.some((m) => m.id === data.message.id);
         if (exists) return prev;
-        // Replace optimistic user message (temp id starting with '_opt_') with authoritative one
         if (data.message.role === 'user') {
           const optimisticIdx = prev.findIndex((m) => m.id.startsWith('_opt_') && m.role === 'user');
           if (optimisticIdx !== -1) {
             const next = [...prev];
-            // Authoritative message from HistoryStore now carries persisted attachments.
             next[optimisticIdx] = data.message;
             return next;
           }
@@ -137,7 +149,6 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
     const streamEndResult = api.onStreamEnd((data) => {
       if (data.threadName !== threadName) return;
 
-      // Capture buffer BEFORE clearing — we may need it as fallback content.
       const currentBuffer = streamBufferRef.current;
 
       console.log('[ChatPanel] onStreamEnd received:', {
@@ -154,8 +165,6 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
       setStreamBuffer('');
       streamBufferRef.current = '';
 
-      // Validate message has the required properties — not just !== null.
-      // Electron IPC serialization or errors could produce partial objects.
       const msg = data.message;
       const isValidMessage =
         msg != null &&
@@ -169,17 +178,11 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
         console.log('[ChatPanel] onStreamEnd: adding valid message, id =', msg.id);
         setMessages((prev) => {
           const exists = prev.some((m) => m.id === msg.id);
-          if (exists) {
-            console.log('[ChatPanel] onStreamEnd: DUPLICATE detected, skipping');
-            return prev;
-          }
-          console.log('[ChatPanel] onStreamEnd: appending to messages, new length =', prev.length + 1);
+          if (exists) return prev;
           return [...prev, msg];
         });
         scrollToBottom();
       } else {
-        // message is missing, null, or malformed — use fallbackText or
-        // the stream buffer so the user doesn't lose visible content.
         const text = data.fallbackText || currentBuffer;
         console.log('[ChatPanel] onStreamEnd: message invalid/null, fallback text length =', text?.length ?? 0);
         if (text) {
@@ -189,13 +192,8 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
             content: text,
             timestamp: Date.now(),
           };
-          setMessages((prev) => {
-            console.log('[ChatPanel] onStreamEnd: appending SYNTHETIC message, new length =', prev.length + 1);
-            return [...prev, synthetic];
-          });
+          setMessages((prev) => [...prev, synthetic]);
           scrollToBottom();
-        } else {
-          console.warn('[ChatPanel] onStreamEnd: NO content available — message will be lost');
         }
       }
     });
@@ -203,9 +201,6 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
 
     const errorResult = api.onError((data) => {
       if (data.threadName !== threadName) return;
-      // Do NOT clear isStreaming or streamBuffer — let stream-end handle
-      // the transition.  Clearing here was causing visible text to vanish
-      // when stderr emitted non-fatal warnings mid-stream.
       setError(data.error);
       scrollToBottom();
     });
@@ -226,9 +221,8 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
     (text: string, attachments: Attachment[]) => {
       setError(null);
       api.sendMessage(text, attachments);
-      // Optimistically add the user message so the UI feels responsive.
       const optimistic: Message = {
-        id: `_opt_${Date.now()}`, // temporary id, replaced by authoritative message
+        id: `_opt_${Date.now()}`,
         role: 'user',
         content: text,
         timestamp: Date.now(),
@@ -244,15 +238,36 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
     api.kill();
   }, [api]);
 
+  const handleSlashCommand = useCallback((command: string) => {
+    switch (command) {
+      case '/include':
+        setOverlay('include');
+        break;
+      case '/revert':
+        setOverlay('revert');
+        break;
+      case '/exit':
+        api.closeTab();
+        break;
+    }
+  }, [api]);
+
+  const handleCloseOverlay = useCallback(() => {
+    setOverlay(null);
+  }, []);
+
+  const handleReverted = useCallback(() => {
+    setOverlay(null);
+    // Reload history from store after revert
+    loadHistory();
+  }, [loadHistory]);
+
   const handleLoadThreads = useCallback(() => {
     api.listThreads().then(setThreads).catch(() => {});
     setShowThreadPicker((prev) => !prev);
   }, [api]);
 
   const isEmpty = messages.length === 0 && !isStreaming && !isLoading;
-
-  // Diagnostic: log every render to trace state changes
-  console.log('[ChatPanel] render: messages =', messages.length, 'isStreaming =', isStreaming, 'streamBuffer =', streamBuffer.length);
 
   return (
     <div className="chat-panel">
@@ -283,41 +298,49 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
           </div>
         )}
       </div>
-      <div className="chat-message-list" ref={messageListRef}>
-        {isLoading && (
-          <div className="chat-status-message chat-status-message--loading">
-            Loading conversation...
-          </div>
-        )}
 
-        {isEmpty && !isLoading && (
-          <div className="chat-status-message chat-status-message--empty">
-            No messages yet. Start the conversation.
-          </div>
-        )}
+      {overlay === 'include' ? (
+        <IncludeOverlay api={api} onClose={handleCloseOverlay} />
+      ) : overlay === 'revert' ? (
+        <RevertOverlay api={api} onClose={handleCloseOverlay} onReverted={handleReverted} />
+      ) : (
+        <div className="chat-message-list" ref={messageListRef}>
+          {isLoading && (
+            <div className="chat-status-message chat-status-message--loading">
+              Loading conversation...
+            </div>
+          )}
 
-        {messages.map((msg) => (
-          <MessageErrorBoundary key={msg.id} fallbackText={msg.content}>
-            <MessageBubble message={msg} />
-          </MessageErrorBoundary>
-        ))}
+          {isEmpty && !isLoading && (
+            <div className="chat-status-message chat-status-message--empty">
+              No messages yet. Start the conversation.
+            </div>
+          )}
 
-        {isStreaming && streamBuffer.length > 0 && (
-          <StreamingResponse text={streamBuffer} />
-        )}
+          {messages.map((msg) => (
+            <MessageErrorBoundary key={msg.id} fallbackText={msg.content}>
+              <MessageBubble message={msg} />
+            </MessageErrorBoundary>
+          ))}
 
-        {error && (
-          <div className="chat-error" role="alert">
-            <span className="chat-error__label">Error:</span> {error}
-          </div>
-        )}
+          {isStreaming && streamBuffer.length > 0 && (
+            <StreamingResponse text={streamBuffer} />
+          )}
 
-        <div ref={scrollAnchorRef} className="chat-scroll-anchor" />
-      </div>
+          {error && (
+            <div className="chat-error" role="alert">
+              <span className="chat-error__label">Error:</span> {error}
+            </div>
+          )}
+
+          <div ref={scrollAnchorRef} className="chat-scroll-anchor" />
+        </div>
+      )}
 
       <ChatInput
         onSend={handleSend}
         onKill={handleKill}
+        onSlashCommand={handleSlashCommand}
         onSaveClipboardImage={api.saveClipboardImage}
         onPickFiles={api.pickFiles}
         disabled={isLoading}

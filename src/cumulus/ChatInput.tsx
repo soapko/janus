@@ -1,9 +1,21 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import type { Attachment } from './types';
 
+interface SlashCommand {
+  name: string;
+  description: string;
+}
+
+const SLASH_COMMANDS: SlashCommand[] = [
+  { name: '/include', description: 'Manage always-include files' },
+  { name: '/revert', description: 'Revert to earlier turn' },
+  { name: '/exit', description: 'Close this chat tab' },
+];
+
 interface ChatInputProps {
   onSend: (text: string, attachments: Attachment[]) => void;
   onKill: () => void;
+  onSlashCommand: (command: string) => void;
   onSaveClipboardImage: () => Promise<Attachment | null>;
   onPickFiles: () => Promise<Attachment[]>;
   disabled: boolean;
@@ -13,6 +25,7 @@ interface ChatInputProps {
 export default function ChatInput({
   onSend,
   onKill,
+  onSlashCommand,
   onSaveClipboardImage,
   onPickFiles,
   disabled,
@@ -20,6 +33,8 @@ export default function ChatInput({
 }: ChatInputProps): React.ReactElement {
   const [value, setValue] = useState('');
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [paletteIndex, setPaletteIndex] = useState(0);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -27,12 +42,12 @@ export default function ChatInput({
   const hasAttachments = attachments.length > 0;
   const hasContent = hasText || hasAttachments;
 
-  // Context-aware button state:
-  //   streaming + no content → Stop
-  //   streaming + content    → Send (interject: kill stream, then send)
-  //   idle + content         → Send
-  //   idle + no content      → Send (disabled)
   const isStopMode = isStreaming && !hasContent;
+
+  // Filter commands by what user has typed
+  const filteredCommands = paletteOpen
+    ? SLASH_COMMANDS.filter(cmd => cmd.name.startsWith(value.trim().toLowerCase()))
+    : [];
 
   // Auto-resize textarea to fit content, up to CSS max-height.
   const resize = useCallback(() => {
@@ -53,8 +68,25 @@ export default function ChatInput({
     setAttachments(prev => prev.filter(a => a.id !== id));
   }, []);
 
+  const executeSlashCommand = useCallback((command: string) => {
+    setPaletteOpen(false);
+    setPaletteIndex(0);
+    setValue('');
+    onSlashCommand(command);
+  }, [onSlashCommand]);
+
   const handleSend = useCallback(() => {
     const trimmed = value.trim();
+
+    // Check if it's a slash command
+    if (trimmed.startsWith('/') && !hasAttachments) {
+      const matched = SLASH_COMMANDS.find(cmd => cmd.name === trimmed);
+      if (matched) {
+        executeSlashCommand(matched.name);
+        return;
+      }
+    }
+
     if ((!trimmed && !hasAttachments) || disabled) return;
     if (isStreaming) {
       onKill();
@@ -62,25 +94,72 @@ export default function ChatInput({
     onSend(trimmed, attachments);
     setValue('');
     setAttachments([]);
+    setPaletteOpen(false);
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto';
       textareaRef.current.style.overflowY = 'hidden';
     }
-  }, [value, attachments, hasAttachments, disabled, isStreaming, onKill, onSend]);
+  }, [value, attachments, hasAttachments, disabled, isStreaming, onKill, onSend, executeSlashCommand]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      if (paletteOpen && filteredCommands.length > 0) {
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          setPaletteIndex(prev => (prev + 1) % filteredCommands.length);
+          return;
+        }
+        if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          setPaletteIndex(prev => (prev - 1 + filteredCommands.length) % filteredCommands.length);
+          return;
+        }
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          executeSlashCommand(filteredCommands[paletteIndex].name);
+          return;
+        }
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          setPaletteOpen(false);
+          setValue('');
+          return;
+        }
+        if (e.key === 'Tab') {
+          e.preventDefault();
+          // Tab-complete the selected command
+          setValue(filteredCommands[paletteIndex].name);
+          setPaletteOpen(false);
+          return;
+        }
+      }
+      if (e.key === 'Escape' && paletteOpen) {
+        e.preventDefault();
+        setPaletteOpen(false);
+        setValue('');
+        return;
+      }
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         handleSend();
       }
     },
-    [handleSend],
+    [handleSend, paletteOpen, filteredCommands, paletteIndex, executeSlashCommand],
   );
 
   const handleChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    setValue(e.target.value);
-  }, []);
+    const newValue = e.target.value;
+    setValue(newValue);
+
+    // Show palette when typing / at start of empty or slash-only input
+    const trimmed = newValue.trim();
+    if (trimmed.startsWith('/') && !trimmed.includes(' ') && !isStreaming) {
+      setPaletteOpen(true);
+      setPaletteIndex(0);
+    } else {
+      setPaletteOpen(false);
+    }
+  }, [isStreaming]);
 
   // Paste handler — detect images in clipboard, otherwise handle text
   const handlePaste = useCallback((e: React.ClipboardEvent<HTMLTextAreaElement>) => {
@@ -116,8 +195,6 @@ export default function ChatInput({
   }, [value, onSaveClipboardImage]);
 
   // Listen for janus-paste-image DOM event (from Electron Edit menu route).
-  // The event is dispatched on the .cumulus-container ancestor, so we walk up
-  // from our ref to find it and attach the listener there.
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
@@ -157,6 +234,26 @@ export default function ChatInput({
 
   return (
     <div className="chat-input-area" ref={containerRef}>
+      {/* Command Palette */}
+      {paletteOpen && filteredCommands.length > 0 && (
+        <div className="command-palette">
+          {filteredCommands.map((cmd, i) => (
+            <div
+              key={cmd.name}
+              className={`command-palette__item ${i === paletteIndex ? 'command-palette__item--active' : ''}`}
+              onMouseDown={(e) => {
+                e.preventDefault(); // prevent textarea blur
+                executeSlashCommand(cmd.name);
+              }}
+              onMouseEnter={() => setPaletteIndex(i)}
+            >
+              <span className="command-palette__name">{cmd.name}</span>
+              <span className="command-palette__desc">{cmd.description}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
       {hasAttachments && (
         <div className="attachment-strip">
           {attachments.map(att => (

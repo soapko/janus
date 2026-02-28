@@ -250,6 +250,38 @@ ipcMain.handle('cumulus:list-threads', async (event) => {
   return bridge.listThreads();
 });
 
+// ===== SLASH COMMAND IPC HANDLERS =====
+
+ipcMain.handle('cumulus:list-include-files', async (event, threadName) => {
+  const bridge = getBridge(event);
+  if (!bridge) return [];
+  return bridge.listIncludeFiles(threadName);
+});
+
+ipcMain.handle('cumulus:add-include-file', async (event, threadName, filePath, scope) => {
+  const bridge = getBridge(event);
+  if (!bridge) return;
+  return bridge.addIncludeFile(threadName, filePath, scope);
+});
+
+ipcMain.handle('cumulus:remove-include-file', async (event, threadName, filePath, scope) => {
+  const bridge = getBridge(event);
+  if (!bridge) return;
+  return bridge.removeIncludeFile(threadName, filePath, scope);
+});
+
+ipcMain.handle('cumulus:get-turns', async (event, threadName) => {
+  const bridge = getBridge(event);
+  if (!bridge) return [];
+  return bridge.getTurns(threadName);
+});
+
+ipcMain.handle('cumulus:revert', async (event, threadName, messageId, restoreGit) => {
+  const bridge = getBridge(event);
+  if (!bridge) return { success: false, removedCount: 0, error: 'No bridge' };
+  return bridge.revert(threadName, messageId, restoreGit);
+});
+
 // ===== ATTACHMENT IPC HANDLERS =====
 
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg']);

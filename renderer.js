@@ -630,6 +630,21 @@ function mountCumulusReact(tab, container, threadName) {
       onStreamChunk: (cb) => window.electronAPI.onCumulusStreamChunk(cb),
       onStreamEnd: (cb) => window.electronAPI.onCumulusStreamEnd(cb),
       onError: (cb) => window.electronAPI.onCumulusError(cb),
+      // Slash command APIs
+      listIncludeFiles: () => window.electronAPI.cumulusListIncludeFiles(threadName),
+      addIncludeFile: (filePath, scope) => window.electronAPI.cumulusAddIncludeFile(threadName, filePath, scope),
+      removeIncludeFile: (filePath, scope) => window.electronAPI.cumulusRemoveIncludeFile(threadName, filePath, scope),
+      getTurns: () => window.electronAPI.cumulusGetTurns(threadName),
+      revert: (messageId, restoreGit) => window.electronAPI.cumulusRevert(threadName, messageId, restoreGit),
+      closeTab: () => {
+        // Close the cumulus tab — find tab by threadName and remove it
+        for (const [tid, t] of tabs) {
+          if (t.type === 'cumulus' && t.typeState.threadName === threadName) {
+            closeTab(tid);
+            break;
+          }
+        }
+      },
     };
     tab.typeState.reactRoot = window.mountCumulusChat(container, api);
   });

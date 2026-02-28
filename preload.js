@@ -52,5 +52,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
     const handler = (_, data) => callback(data);
     ipcRenderer.on('cumulus:error', handler);
     return () => ipcRenderer.removeListener('cumulus:error', handler);
-  }
+  },
+
+  // Slash command APIs
+  cumulusListIncludeFiles: (thread) => ipcRenderer.invoke('cumulus:list-include-files', thread),
+  cumulusAddIncludeFile: (thread, filePath, scope) => ipcRenderer.invoke('cumulus:add-include-file', thread, filePath, scope),
+  cumulusRemoveIncludeFile: (thread, filePath, scope) => ipcRenderer.invoke('cumulus:remove-include-file', thread, filePath, scope),
+  cumulusGetTurns: (thread) => ipcRenderer.invoke('cumulus:get-turns', thread),
+  cumulusRevert: (thread, messageId, restoreGit) => ipcRenderer.invoke('cumulus:revert', thread, messageId, restoreGit),
 });

@@ -18,6 +18,25 @@ export interface Attachment {
   mimeType: string;
 }
 
+export interface IncludeFileInfo {
+  path: string;
+  scope: 'global' | 'thread';
+}
+
+export interface TurnInfo {
+  id: string;
+  userMessage: string;
+  assistantMessage?: string;
+  timestamp: number;
+  hasSnapshot: boolean;
+}
+
+export interface RevertResult {
+  success: boolean;
+  removedCount: number;
+  error?: string;
+}
+
 export interface CumulusChatAPI {
   sendMessage: (message: string, attachments?: Attachment[]) => void;
   kill: () => void;
@@ -30,4 +49,11 @@ export interface CumulusChatAPI {
   onStreamChunk: (callback: (data: { threadName: string; text: string }) => void) => void;
   onStreamEnd: (callback: (data: { threadName: string; message: Message | null; fallbackText?: string | null }) => void) => void;
   onError: (callback: (data: { threadName: string; error: string }) => void) => void;
+  // Slash command APIs
+  listIncludeFiles: () => Promise<IncludeFileInfo[]>;
+  addIncludeFile: (filePath: string, scope: 'global' | 'thread') => Promise<void>;
+  removeIncludeFile: (filePath: string, scope: 'global' | 'thread') => Promise<void>;
+  getTurns: () => Promise<TurnInfo[]>;
+  revert: (messageId: string, restoreGit: boolean) => Promise<RevertResult>;
+  closeTab: () => void;
 }

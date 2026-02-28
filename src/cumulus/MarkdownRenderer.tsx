@@ -1,6 +1,7 @@
 import React, { useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
 import rehypeHighlight from 'rehype-highlight';
+import remarkGfm from 'remark-gfm';
 
 interface MarkdownRendererProps {
   content: string;
@@ -72,6 +73,7 @@ export default function MarkdownRenderer({ content }: MarkdownRendererProps): Re
   return (
     <div className="markdown-body">
       <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
         rehypePlugins={[rehypeHighlight]}
         components={{
           code: CodeBlock as React.ComponentType<React.HTMLAttributes<HTMLElement>>,

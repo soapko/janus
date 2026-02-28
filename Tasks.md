@@ -28,3 +28,10 @@
   - Browser screenshot -> chat context
   - Feedback mode upgrade to persistent chat
   - Project-scoped thread management
+
+- [◒] 015: Slash commands & command palette -> [015-slash-commands.md](docs/tasks/015-slash-commands.md)
+  - Command palette: `/` prefix detection, filtered dropdown, keyboard nav
+  - `/include`: Always-include file manager overlay (list/add/remove)
+  - `/revert`: Turn picker with git restore toggle
+  - `/exit`: Close cumulus tab
+  - IPC bridge extensions for include/revert APIs

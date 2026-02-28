@@ -582,6 +582,70 @@ class CumulusBridge {
     return files.map(f => f.replace(/\.jsonl$/, ''));
   }
 
+  async listIncludeFiles(threadName) {
+    const lib = await loadCumulus();
+    const result = await lib.listAlwaysIncludeFiles(threadName);
+    const files = [];
+    for (const p of result.global) {
+      files.push({ path: p, scope: 'global' });
+    }
+    for (const p of result.thread) {
+      files.push({ path: p, scope: 'thread' });
+    }
+    return files;
+  }
+
+  async addIncludeFile(threadName, filePath, scope) {
+    const lib = await loadCumulus();
+    const threadArg = scope === 'thread' ? threadName : undefined;
+    await lib.addAlwaysIncludeFile(filePath, threadArg);
+  }
+
+  async removeIncludeFile(threadName, filePath, scope) {
+    const lib = await loadCumulus();
+    const threadArg = scope === 'thread' ? threadName : undefined;
+    await lib.removeAlwaysIncludeFile(filePath, threadArg);
+  }
+
+  async getTurns(threadName) {
+    const thread = await this.getOrCreateThread(threadName);
+    const messages = await thread.history.getAll();
+    const turns = [];
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      if (msg.role !== 'user') continue;
+      const assistant = messages[i + 1];
+      turns.push({
+        id: msg.id,
+        userMessage: msg.content,
+        assistantMessage: assistant?.role === 'assistant' ? assistant.content : undefined,
+        timestamp: msg.timestamp,
+        hasSnapshot: !!(msg.metadata?.gitSnapshot),
+      });
+    }
+    // Most recent first
+    return turns.reverse();
+  }
+
+  async revert(threadName, messageId, restoreGit) {
+    const lib = await loadCumulus();
+    const thread = await this.getOrCreateThread(threadName);
+    try {
+      const result = await lib.executeRevert(thread.history, messageId, { restoreGit });
+      return {
+        success: result.success,
+        removedCount: result.removedCount,
+        error: result.error || null,
+      };
+    } catch (err) {
+      return {
+        success: false,
+        removedCount: 0,
+        error: err.message || String(err),
+      };
+    }
+  }
+
   destroy() {
     // Kill all running processes
     for (const [threadName, proc] of this.activeProcesses) {
