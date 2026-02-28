@@ -1,38 +1,70 @@
 # Janus
 
-A two-panel macOS developer tool built with Electron that combines a web browser and terminal side by side. Named after the Roman god of duality, Janus lets you view your web app and interact with your terminal in a single window — ideal for local development workflows.
+A multi-panel macOS developer workspace built with Electron. Terminals, a web browser, and an AI chat — each in their own tab, viewable solo or side by side.
+
+Named after the Roman god of beginnings and transitions, Janus puts everything you need for local development in a single window.
 
 ## Features
 
-- **Split-panel layout** — Resizable browser and terminal panels side by side
-- **Tabbed terminals** — Multiple terminal tabs powered by `node-pty` and `xterm.js`, each running a login shell with full PATH support
-- **Tabbed browser** — Multiple browser tabs using Electron webviews with navigation controls (back, forward, reload, URL bar)
-- **Multi-window support** — Open multiple Janus windows, each tied to a different project folder (`Cmd+N`)
-- **Project color coding** — Each project gets a randomly assigned title bar color (configurable via Window > Project Color menu) persisted across sessions
-- **Browser panel toggle** — Collapse/expand the browser panel to maximize terminal space (`Cmd+\`). Starts collapsed by default
-- **Terminal zoom** — Adjust terminal font size with `Cmd+`/`Cmd-` (range: 8–32px)
-- **Scroll-to-bottom button** — Appears when scrolled up in a terminal; click to snap back to the latest output
-- **Drag and drop** — Drop files onto the terminal to insert the escaped path, or onto the browser to open them
-- **Feedback mode** — Click the feedback button (⊙) in the browser toolbar to select a UI element, then submit feedback that gets sent to Claude CLI in a dedicated terminal tab
-- **Close tab shortcut** — `Cmd+W` closes the active tab in whichever panel (browser or terminal) is currently selected
-- **Batched rendering** — PTY output and xterm writes are batched at ~60fps to eliminate scroll flickering during rapid streaming (e.g., LLM output)
+### Unified Tab System
+
+Every panel lives in a single tab bar. Click a tab to view it full-width, or **Cmd+Click** multiple tabs to show them side by side with resizable dividers.
+
+- **Terminal tabs** — Full terminal emulator powered by `node-pty` and `xterm.js`, running your login shell with complete PATH support
+- **Web tabs** — Embedded browser with navigation controls (back, forward, reload, URL bar) via Electron webviews
+- **Chat tabs** — AI chat powered by Claude CLI with streaming responses, markdown rendering, and conversation threading
+- **+ button** — Click to pick a tab type (Terminal, Web, or Chat)
+- **Drag to reorder** — Drag tabs to rearrange them; panel order follows tab order
+
+### AI Chat
+
+The chat panel connects to Claude CLI and supports:
+
+- Streaming responses with live markdown rendering
+- Image and file attachments (paste or pick from file dialog)
+- Conversation history persistence via threads
+- Context from other panels (see Cross-Panel Integration below)
+
+### Cross-Panel Integration
+
+- **Terminal → Chat** (`Cmd+Shift+C`) — Sends the last 50 lines of terminal output to the chat for help
+- **Browser → Chat** (`Cmd+Shift+S`) — Sends the current page URL to the chat for discussion
+- **Feedback mode** — Click the ⊙ button in a web tab's toolbar, select a UI element, and submit feedback that routes to the chat with the element's HTML and selector
+
+### Multi-Window & Projects
+
+- **Cmd+N** — Open a new window tied to a different project folder
+- **Project color coding** — Each project gets a unique title bar color, persisted across sessions and configurable via Window > Project Color
+
+### Terminal
+
+- **Zoom** — `Cmd+=` / `Cmd+-` to adjust font size (8–32px range)
+- **Scroll-to-bottom** — A button appears when scrolled up; click to snap back to latest output
+- **Batched rendering** — PTY writes are batched at ~60fps to eliminate scroll flickering during rapid output
+- **Drag and drop** — Drop a file onto a terminal to insert its escaped path
 
 ## Architecture
 
 ```
-main.js            Electron main process — window management, PTY lifecycle, IPC, menus
-preload.js         Context bridge exposing electronAPI to the renderer
-renderer.js        Renderer process — browser tabs, terminal tabs, UI interactions
-projectColors.js   Per-project color persistence (~/.janus-colors.json)
-index.html         Single-page UI with inline CSS
-forge.config.js    Electron Forge packaging/signing configuration
+main.js              Electron main process — windows, PTY lifecycle, IPC, menus
+preload.js           Context bridge (electronAPI)
+renderer.js          Renderer process — tab system, panels, keyboard shortcuts
+index.html           UI shell with inline CSS
+
+src/cumulus/          React chat UI (ChatPanel, ChatInput, MessageBubble, etc.)
+dist/cumulus-chat.js  Chat bundle (built by esbuild)
+cumulus-bridge.js     Claude CLI subprocess manager, stream parser, thread persistence
+
+projectColors.js     Per-project color storage (~/.janus-colors.json)
+forge.config.js      Electron Forge packaging configuration
 ```
 
 ## Prerequisites
 
-- **macOS** (primary target; uses `hiddenInset` title bar and macOS-specific menu patterns)
+- **macOS** (uses `hiddenInset` title bar and macOS menu patterns)
 - **Node.js** (LTS recommended)
 - **Electron 28+**
+- **Claude CLI** — Required for the chat panel. Install from [claude.ai](https://claude.ai)
 
 ## Getting Started
 
@@ -47,26 +79,32 @@ npm run rebuild
 npm start
 ```
 
-On launch, Janus prompts you to select a project folder. The terminal opens in that directory, and the window title updates to show the folder name.
+On launch, Janus prompts you to select a project folder. A chat tab opens by default — use the **+** button to add terminals and web panels.
 
 ## Scripts
 
 | Command | Description |
 |---------|-------------|
-| `npm start` | Launch via Electron Forge |
-| `npm run package` | Package the app (unsigned) |
+| `npm start` | Build chat bundle and launch via Electron Forge |
+| `npm run package` | Package the app (unsigned `.app` bundle) |
 | `npm run make` | Build distributable (DMG/ZIP for macOS) |
 | `npm run rebuild` | Rebuild native modules (`node-pty`) for Electron |
+| `npm run build:chat` | Build the React chat bundle only |
+| `npm run watch:chat` | Watch and rebuild the chat bundle on changes |
 
 ## Keyboard Shortcuts
 
 | Shortcut | Action |
 |----------|--------|
 | `Cmd+N` | New window (select project folder) |
-| `Cmd+W` | Close active tab in selected panel |
-| `Cmd+R` | Reload active browser tab |
-| `Cmd+\` | Toggle browser panel |
+| `Cmd+T` | New terminal tab |
+| `Cmd+W` | Close active tab |
+| `Cmd+1`–`Cmd+9` | Switch to tab N |
+| `Cmd+Click` tab | Toggle tab visibility (show multiple panels) |
+| `Cmd+R` | Reload active web tab |
 | `Cmd+=` / `Cmd+-` | Zoom terminal in/out |
+| `Cmd+Shift+C` | Send terminal output to chat |
+| `Cmd+Shift+S` | Send browser page to chat |
 
 ## License
 

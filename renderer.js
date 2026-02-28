@@ -809,6 +809,17 @@ document.addEventListener('mousemove', (e) => {
 
 document.addEventListener('mouseup', () => {
   if (resizeDragState) {
+    // Convert pixel-based flex to proportional flex-grow so panels
+    // maintain their ratio but still resize with the window
+    const visibleTabs = [...tabs.values()].filter(t => t.visible);
+    const widths = visibleTabs.map(t => t.panelEl.getBoundingClientRect().width);
+    const totalWidth = widths.reduce((a, b) => a + b, 0);
+    if (totalWidth > 0) {
+      visibleTabs.forEach((tab, i) => {
+        tab.panelEl.style.flex = `${widths[i] / totalWidth} 1 0%`;
+      });
+    }
+
     resizeDragState = null;
     document.body.style.cursor = '';
     enableWebviewPointerEvents();
