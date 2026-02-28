@@ -532,6 +532,15 @@ app.whenReady().then(() => {
     }
   });
 
+  // Allow microphone access for the main window (voice-to-text in chat)
+  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
+    if (['media', 'audioCapture'].includes(permission)) {
+      callback(true);
+    } else {
+      callback(true); // Allow all permissions for the main window
+    }
+  });
+
   createMenu();
   setupMenuRefresh();
   createWindow();

@@ -35,3 +35,9 @@
   - `/revert`: Turn picker with git restore toggle
   - `/exit`: Close cumulus tab
   - IPC bridge extensions for include/revert APIs
+
+- [◒] 016: Voice-to-text input -> [016-voice-to-text.md](docs/tasks/016-voice-to-text.md)
+  - Moonshine JS (local, MIT, free) for on-device speech recognition
+  - Mic button in chat input with recording state indicator
+  - Streaming transcription with VAD (auto-detects speech pauses)
+  - Microphone permission handling in Electron

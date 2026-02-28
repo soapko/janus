@@ -1,6 +1,32 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import type { Attachment } from './types';
 
+// Moonshine is loaded as a window global from index.html (ESM dynamic import)
+declare global {
+  interface Window {
+    Moonshine?: {
+      MicrophoneTranscriber: new (
+        model: string,
+        callbacks: {
+          onTranscriptionCommitted?: (text: string) => void;
+          onTranscriptionUpdated?: (text: string) => void;
+        },
+        useVAD?: boolean,
+      ) => {
+        start: () => Promise<void>;
+        stop: () => void;
+      };
+      Settings: {
+        BASE_ASSET_PATH: {
+          MOONSHINE: string;
+          ONNX_RUNTIME: string;
+          SILERO_VAD: string;
+        };
+      };
+    };
+  }
+}
+
 interface SlashCommand {
   name: string;
   description: string;
@@ -35,8 +61,15 @@ export default function ChatInput({
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [paletteIndex, setPaletteIndex] = useState(0);
+  const [isRecording, setIsRecording] = useState(false);
+  const [micLoading, setMicLoading] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const transcriberRef = useRef<ReturnType<NonNullable<typeof window.Moonshine>['MicrophoneTranscriber']> | null>(null);
+  // Track the text that existed before recording started, so streaming updates append correctly
+  const preRecordTextRef = useRef('');
+  // Track the committed text accumulated during this recording session
+  const committedTextRef = useRef('');
 
   const hasText = value.trim().length > 0;
   const hasAttachments = attachments.length > 0;
@@ -75,6 +108,99 @@ export default function ChatInput({
     onSlashCommand(command);
   }, [onSlashCommand]);
 
+  const stopRecording = useCallback(() => {
+    if (transcriberRef.current) {
+      transcriberRef.current.stop();
+      transcriberRef.current = null;
+    }
+    setIsRecording(false);
+  }, []);
+
+  const toggleRecording = useCallback(async () => {
+    if (isRecording) {
+      stopRecording();
+      return;
+    }
+
+    const Moonshine = window.Moonshine;
+    if (!Moonshine) {
+      console.error('Moonshine not loaded yet');
+      return;
+    }
+
+    setMicLoading(true);
+    preRecordTextRef.current = value;
+    committedTextRef.current = '';
+
+    try {
+      let frameLogCount = 0;
+      const transcriber = new Moonshine.MicrophoneTranscriber(
+        'model/tiny',
+        {
+          onTranscriptionUpdated(text: string) {
+            console.log('[Mic] Transcription updated:', text);
+            // Show live partial transcript — append to pre-existing + committed text
+            const base = preRecordTextRef.current;
+            const committed = committedTextRef.current;
+            const separator = (base && !base.endsWith(' ') && !base.endsWith('\n')) ? ' ' : '';
+            const commitSep = (committed && !committed.endsWith(' ')) ? ' ' : '';
+            setValue(base + separator + committed + commitSep + text);
+          },
+          onTranscriptionCommitted(text: string) {
+            console.log('[Mic] Transcription committed:', text);
+            // Finalize this chunk — add to committed buffer
+            const prev = committedTextRef.current;
+            const separator = (prev && !prev.endsWith(' ')) ? ' ' : '';
+            committedTextRef.current = prev + separator + text;
+            // Update displayed value
+            const base = preRecordTextRef.current;
+            const baseSep = (base && !base.endsWith(' ') && !base.endsWith('\n')) ? ' ' : '';
+            setValue(base + baseSep + committedTextRef.current);
+          },
+          onModelLoadStarted() {
+            console.log('[Mic] Model loading started');
+          },
+          onModelLoaded() {
+            console.log('[Mic] Model loaded and ready');
+          },
+          onError(err: unknown) {
+            console.error('[Mic] Moonshine error:', err);
+          },
+          onSpeechStart() {
+            console.log('[Mic] >>> Speech START detected by VAD');
+          },
+          onSpeechEnd() {
+            console.log('[Mic] <<< Speech END detected by VAD');
+          },
+          onFrame(probs: { isSpeech: number }, _frame: unknown, ema: number) {
+            if (frameLogCount < 20) {
+              console.log(`[Mic] Frame #${frameLogCount}: isSpeech=${probs?.isSpeech?.toFixed(4)}, ema=${ema?.toFixed(4)}`);
+              frameLogCount++;
+            } else if (frameLogCount === 20) {
+              console.log('[Mic] (suppressing further frame logs)');
+              frameLogCount++;
+            }
+          },
+        },
+        false, // useVAD=false → streaming mode (live partial transcription)
+      );
+
+      transcriberRef.current = transcriber;
+
+      // MicrophoneTranscriber.start() resolves after getting mic access,
+      // but fires-and-forgets the model load. The pre-loader in index.html
+      // ensures the model is already cached, so load is near-instant.
+      await transcriber.start();
+      console.log('[Mic] Transcriber started, recording active');
+      setIsRecording(true);
+    } catch (err: unknown) {
+      console.error('Mic recording failed:', err);
+      transcriberRef.current = null;
+    } finally {
+      setMicLoading(false);
+    }
+  }, [isRecording, value, stopRecording]);
+
   const handleSend = useCallback(() => {
     const trimmed = value.trim();
 
@@ -88,6 +214,8 @@ export default function ChatInput({
     }
 
     if ((!trimmed && !hasAttachments) || disabled) return;
+    // Stop recording if active before sending
+    if (isRecording) stopRecording();
     if (isStreaming) {
       onKill();
     }
@@ -99,7 +227,7 @@ export default function ChatInput({
       textareaRef.current.style.height = 'auto';
       textareaRef.current.style.overflowY = 'hidden';
     }
-  }, [value, attachments, hasAttachments, disabled, isStreaming, onKill, onSend, executeSlashCommand]);
+  }, [value, attachments, hasAttachments, disabled, isStreaming, isRecording, onKill, onSend, executeSlashCommand, stopRecording]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -307,6 +435,16 @@ export default function ChatInput({
           rows={1}
           aria-label="Message input"
         />
+        <button
+          className={`chat-input-mic-btn ${isRecording ? 'chat-input-mic-btn--recording' : ''} ${micLoading ? 'chat-input-mic-btn--loading' : ''}`}
+          onClick={toggleRecording}
+          type="button"
+          disabled={disabled || micLoading || !window.Moonshine}
+          aria-label={isRecording ? 'Stop recording' : 'Start voice input'}
+          title={isRecording ? 'Stop recording' : (window.Moonshine ? 'Voice input' : 'Voice input (loading...)')}
+        >
+          {micLoading ? '...' : isRecording ? '●' : '🎙'}
+        </button>
         <button
           className={`chat-input-btn ${isStopMode ? 'chat-input-btn--stop' : 'chat-input-btn--send'}`}
           onClick={handleButtonClick}

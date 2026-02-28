@@ -14,7 +14,7 @@ module.exports = {
     appBundleId: 'com.karl.janus',
     appCategoryType: 'public.app-category.developer-tools',
     asar: {
-      unpack: '**/{*.node,node-pty/**/*,onnxruntime-node/**/*,sharp/**/*}'
+      unpack: '**/{*.node,*.onnx,node-pty/**/*,onnxruntime-node/**/*,sharp/**/*,@moonshine-ai/**/*}'
     },
     // Resolve symlinked dependencies (e.g. cumulus via file:../cumulus) before ASAR packaging.
     // The symlink in the temp build dir points to a relative path that doesn't exist,
@@ -39,6 +39,23 @@ module.exports = {
       } catch (err) {
         console.warn('[forge] Failed to resolve cumulus symlink:', err.message);
       }
+
+      // Fix broken @ricky0123/vad-web symlink — it's bundled into moonshine.min.js,
+      // but the dependency walker needs a resolvable module
+      const vadWebLink = path.join(buildPath, 'node_modules', '@ricky0123', 'vad-web');
+      try {
+        const vadStat = fs.lstatSync(vadWebLink);
+        if (vadStat.isSymbolicLink()) {
+          fs.unlinkSync(vadWebLink);
+          fs.mkdirSync(vadWebLink, { recursive: true });
+          fs.writeFileSync(path.join(vadWebLink, 'package.json'), JSON.stringify({ name: '@ricky0123/vad-web', version: '0.0.24', main: 'index.js' }));
+          fs.writeFileSync(path.join(vadWebLink, 'index.js'), 'module.exports = {};');
+          console.log('[forge] Created stub for @ricky0123/vad-web (bundled in moonshine)');
+        }
+      } catch (err) {
+        // Symlink might not exist in build dir — that's fine
+      }
+
       callback();
     }],
     // Uncomment and add path when you have an icon

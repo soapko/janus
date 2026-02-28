@@ -498,6 +498,57 @@
   max-width: 14em;
 }
 
+/* ---- Mic Button ---- */
+.chat-input-mic-btn {
+  flex: 0 0 auto;
+  width: 2.7em;
+  height: 2.7em;
+  border: 1px solid #4a4a4a;
+  border-radius: 0.55em;
+  background: #3d3d3d;
+  color: #aaa;
+  font-size: 1em;
+  font-family: inherit;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+  line-height: 1;
+  padding: 0;
+}
+
+.chat-input-mic-btn:hover:not(:disabled) {
+  background: #4d4d4d;
+  color: #ddd;
+}
+
+.chat-input-mic-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.chat-input-mic-btn--recording {
+  background: #8b2222;
+  border-color: #cc3333;
+  color: #ffcccc;
+  animation: mic-pulse 1.5s ease-in-out infinite;
+}
+
+.chat-input-mic-btn--recording:hover:not(:disabled) {
+  background: #aa2222;
+}
+
+.chat-input-mic-btn--loading {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+@keyframes mic-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(204, 51, 51, 0.4); }
+  50%      { box-shadow: 0 0 0 4px rgba(204, 51, 51, 0); }
+}
+
 /* ---- Send / Stop Button ---- */
 .chat-input-btn {
   flex: 0 0 auto;

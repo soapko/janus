@@ -467,6 +467,31 @@
 
   <script src="node_modules/xterm/lib/xterm.js"></script>
   <script src="node_modules/xterm-addon-fit/lib/xterm-addon-fit.js"></script>
+  <script>
+    // Preload Moonshine voice-to-text library (ESM → window global)
+    import('./node_modules/@moonshine-ai/moonshine-js/dist/moonshine.min.js').then(mod => {
+      mod.Settings.VERBOSE_LOGGING = true;
+      window.Moonshine = mod;
+
+      // Pre-load the STT model so it's ready when the user presses mic.
+      // Without this, model downloads ~28MB from CDN on first mic click,
+      // and start() resolves before the download finishes — so speech
+      // during the download is lost.
+      console.log('[Moonshine] Pre-loading model...');
+      const preloader = new mod.Transcriber('model/tiny', {
+        onModelLoadStarted: () => console.log('[Moonshine] Model download started'),
+        onError: (err) => console.error('[Moonshine] Pre-load error:', err),
+      });
+      preloader.load().then(() => {
+        console.log('[Moonshine] Model pre-loaded and ready');
+        window._moonshineReady = true;
+      }).catch(err => {
+        console.error('[Moonshine] Pre-load failed:', err);
+      });
+    }).catch(err => {
+      console.warn('Moonshine voice-to-text failed to load:', err.message);
+    });
+  </script>
   <script src="dist/cumulus-chat.js"></script>
   <script src="renderer.js"></script>
 </body>

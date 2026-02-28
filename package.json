@@ -19,6 +19,7 @@
   "dependencies": {
     "@huggingface/transformers": "^3.8.1",
     "@modelcontextprotocol/sdk": "^1.26.0",
+    "@moonshine-ai/moonshine-js": "^0.1.29",
     "commander": "^14.0.3",
     "cumulus": "file:../cumulus",
     "electron-squirrel-startup": "^1.0.1",

@@ -44,3 +44,20 @@ try {
   console.error('[prepackage] Error:', err.message);
   process.exit(1);
 }
+
+// Fix @moonshine-ai/moonshine-js — it has a broken file: dependency
+// on @ricky0123/vad-web that doesn't exist in the npm-installed version.
+// The dist bundle is self-contained (loads VAD from CDN at runtime).
+try {
+  const moonshinePkgPath = path.join(__dirname, '..', 'node_modules', '@moonshine-ai', 'moonshine-js', 'package.json');
+  if (fs.existsSync(moonshinePkgPath)) {
+    const pkg = JSON.parse(fs.readFileSync(moonshinePkgPath, 'utf8'));
+    if (pkg.dependencies && pkg.dependencies['@ricky0123/vad-web']) {
+      delete pkg.dependencies['@ricky0123/vad-web'];
+      fs.writeFileSync(moonshinePkgPath, JSON.stringify(pkg, null, 2) + '\n');
+      console.log('[prepackage] Removed broken @ricky0123/vad-web file: dependency from moonshine-js');
+    }
+  }
+} catch (err) {
+  console.error('[prepackage] Warning - moonshine-js fix:', err.message);
+}
