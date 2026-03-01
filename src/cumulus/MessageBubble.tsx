@@ -21,6 +21,24 @@ function hasRichContent(text: string): boolean {
   return /```/.test(text) || text.split('\n').length > 3;
 }
 
+/** Deterministic color from agent name — 6 visually distinct hues */
+const AGENT_COLORS = [
+  '#9966cc', // purple
+  '#2aa198', // teal
+  '#e69500', // orange
+  '#d33682', // rose
+  '#85c025', // lime
+  '#ff6b6b', // coral
+];
+
+function agentColor(name: string): string {
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) {
+    hash = ((hash << 5) - hash + name.charCodeAt(i)) | 0;
+  }
+  return AGENT_COLORS[Math.abs(hash) % AGENT_COLORS.length];
+}
+
 /** Parse inter-agent message prefix: [From agent "name"]: and strip reply hint */
 function parseAgentMessage(content: string): { agentName: string; body: string } | null {
   const match = content.match(/^\[From agent "([^"]+)"\]:\n([\s\S]+)$/);
@@ -71,8 +89,9 @@ export default function MessageBubble({ message }: MessageBubbleProps): React.Re
   const agentInfo = isUser ? parseAgentMessage(message.content) : null;
 
   if (agentInfo) {
+    const color = agentColor(agentInfo.agentName);
     return (
-      <div className="message-bubble message-bubble--agent">
+      <div className="message-bubble message-bubble--agent" style={{ '--agent-color': color } as React.CSSProperties}>
         <div className="message-bubble__agent-tag">{agentInfo.agentName}</div>
         <div className="message-bubble__content">
           <MarkdownRenderer content={agentInfo.body} />

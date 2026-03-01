@@ -246,7 +246,7 @@
   max-width: 100%;
   width: 100%;
   overflow: hidden;
-  border-left: 2px solid #b58900;
+  border-left: 2px solid var(--agent-color, #b58900);
   padding-left: 0.75em;
 }
 
@@ -255,7 +255,7 @@
   font-size: 0.78em;
   font-weight: 600;
   font-family: 'SF Mono', 'Fira Code', Consolas, monospace;
-  color: #b58900;
+  color: var(--agent-color, #b58900);
   margin-bottom: 0.2em;
 }
 
