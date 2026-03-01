@@ -235,6 +235,40 @@
   overflow: hidden;             /* Contain code blocks so their overflow-x: auto works */
 }
 
+/* Agent messages (inter-agent) — left-aligned, distinct from user/assistant */
+.message-bubble--agent {
+  align-items: flex-start;
+}
+
+.message-bubble--agent .message-bubble__content {
+  background: transparent;
+  padding: 0.4em 0;
+  max-width: 100%;
+  width: 100%;
+  overflow: hidden;
+  border-left: 2px solid #b58900;
+  padding-left: 0.75em;
+}
+
+.message-bubble__agent-tag {
+  display: inline-block;
+  font-size: 0.78em;
+  font-weight: 600;
+  font-family: 'SF Mono', 'Fira Code', Consolas, monospace;
+  color: #b58900;
+  margin-bottom: 0.2em;
+}
+
+.message-bubble__agent-tag::before {
+  content: '[';
+  opacity: 0.6;
+}
+
+.message-bubble__agent-tag::after {
+  content: ']';
+  opacity: 0.6;
+}
+
 /* Timestamp */
 .message-bubble__timestamp {
   font-size: 0.8em;

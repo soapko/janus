@@ -21,6 +21,15 @@ function hasRichContent(text: string): boolean {
   return /```/.test(text) || text.split('\n').length > 3;
 }
 
+/** Parse inter-agent message prefix: [From agent "name"]: and strip reply hint */
+function parseAgentMessage(content: string): { agentName: string; body: string } | null {
+  const match = content.match(/^\[From agent "([^"]+)"\]:\n([\s\S]+)$/);
+  if (!match) return null;
+  // Strip the reply hint line (parenthetical at the end starting with "Reply using send_to_agent")
+  const body = match[2].replace(/\n*\(Reply using send_to_agent\([\s\S]*$/, '').trim();
+  return { agentName: match[1], body };
+}
+
 function getExtension(name: string): string {
   const dot = name.lastIndexOf('.');
   return dot >= 0 ? name.slice(dot + 1).toUpperCase() : '?';
@@ -57,6 +66,25 @@ export default function MessageBubble({ message }: MessageBubbleProps): React.Re
   const hasText = message.content.trim().length > 0;
   const isRichUser = isUser && hasRichContent(message.content);
   const hasVerboseSegments = !isUser && message.segments && message.segments.some((s) => s.type !== 'text');
+
+  // Detect inter-agent messages
+  const agentInfo = isUser ? parseAgentMessage(message.content) : null;
+
+  if (agentInfo) {
+    return (
+      <div className="message-bubble message-bubble--agent">
+        <div className="message-bubble__agent-tag">{agentInfo.agentName}</div>
+        <div className="message-bubble__content">
+          <MarkdownRenderer content={agentInfo.body} />
+        </div>
+        {timeLabel && (
+          <div className="message-bubble__timestamp" aria-label={`Sent at ${timeLabel}`}>
+            {timeLabel}
+          </div>
+        )}
+      </div>
+    );
+  }
 
   const bubbleClass = isRichUser || hasAttachments
     ? 'message-bubble message-bubble--user message-bubble--user-rich'

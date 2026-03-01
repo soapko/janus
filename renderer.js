@@ -574,7 +574,7 @@ function createCumulusTab(threadName) {
   const tab = {
     id,
     type: 'cumulus',
-    label: 'Chat',
+    label: threadName,
     visible: false,
     tabEl: null,
     panelEl,
@@ -594,6 +594,10 @@ function createCumulusTab(threadName) {
         const folderName = projectPath.split('/').pop() || 'default';
         tab.typeState.threadName = folderName;
         threadName = folderName;
+        // Update tab label to reflect resolved thread name
+        tab.label = folderName;
+        const titleEl = tab.tabEl.querySelector('.tab-title');
+        if (titleEl) titleEl.textContent = folderName;
       }
       mountCumulusReact(tab, container, threadName);
     });
@@ -658,6 +662,11 @@ function mountCumulusReact(tab, container, threadName) {
         container.innerHTML = '';
         // Update thread name
         tab.typeState.threadName = newThreadName;
+        threadName = newThreadName;
+        // Update tab label to reflect new thread name
+        tab.label = newThreadName;
+        const titleEl = tab.tabEl.querySelector('.tab-title');
+        if (titleEl) titleEl.textContent = newThreadName;
         // Remount with new thread
         mountCumulusReact(tab, container, newThreadName);
       },

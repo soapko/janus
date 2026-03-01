@@ -782,7 +782,7 @@ class CumulusBridge {
       await new Promise(r => setTimeout(r, 100));
     }
 
-    const formatted = `[From agent "${senderName}"]:\n${messageText}\n\n(Reply using send_to_agent("${senderName}", your_response) to respond directly)`;
+    const formatted = `[From agent "${senderName}"]:\n${messageText}\n\n(Reply using send_to_agent("${senderName}", your_response) to respond directly. Be concise and task-focused — no pleasantries or sign-offs.)`;
     return this.sendMessage(threadName, formatted, win);
   }
 
