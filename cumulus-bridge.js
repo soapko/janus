@@ -352,6 +352,37 @@ class CumulusBridge {
     return thread;
   }
 
+  /**
+   * Resolve the working directory for a thread.
+   * Fallback chain: threadConfig.projectDir → sibling folder match → this.projectPath → homedir
+   */
+  async resolveThreadCwd(threadName) {
+    const lib = await loadCumulus();
+
+    // 1. Check thread config for explicit projectDir
+    const globalConfig = await lib.loadGlobalConfig();
+    const threadConfig = await lib.loadThreadConfig(threadName);
+    const mergedConfig = lib.mergeConfigs(globalConfig, threadConfig);
+    if (mergedConfig.projectDir && fs.existsSync(mergedConfig.projectDir)) {
+      return mergedConfig.projectDir;
+    }
+
+    // 2. Convention: sibling folder with same name as thread
+    if (this.projectPath) {
+      const parentDir = path.dirname(this.projectPath);
+      const siblingDir = path.join(parentDir, threadName);
+      if (siblingDir !== this.projectPath && fs.existsSync(siblingDir)) {
+        try {
+          const stat = fs.statSync(siblingDir);
+          if (stat.isDirectory()) return siblingDir;
+        } catch { /* ignore */ }
+      }
+    }
+
+    // 3. Window-level project path (default)
+    return this.projectPath || os.homedir();
+  }
+
   async sendMessage(threadName, messageText, win, attachments = []) {
     const lib = await loadCumulus();
     const thread = await this.getOrCreateThread(threadName);
@@ -445,11 +476,14 @@ class CumulusBridge {
       .filter(m => m.role !== 'session')
       .map(m => ({ role: m.role, content: m.content }));
 
-    // Load always-include files
+    // Resolve per-thread working directory
+    const threadCwd = await this.resolveThreadCwd(threadName);
+
+    // Load always-include files (use thread cwd for relative path resolution)
     const globalConfig = await lib.loadGlobalConfig();
     const threadConfig = await lib.loadThreadConfig(threadName);
     const mergedConfig = lib.mergeConfigs(globalConfig, threadConfig);
-    const alwaysInclude = await lib.readAlwaysIncludeFiles(mergedConfig, this.projectPath || process.cwd());
+    const alwaysInclude = await lib.readAlwaysIncludeFiles(mergedConfig, threadCwd);
 
     // Calculate RAG budget
     const userQueryTokens = lib.estimateTokens(messageText);
@@ -518,11 +552,10 @@ class CumulusBridge {
     );
 
     const claudePath = resolveClaudeCli();
-    const cwd = this.projectPath || os.homedir();
     const claude = spawn(claudePath, args, {
       stdio: [hasImages ? 'pipe' : 'ignore', 'pipe', 'pipe'],
       env: cleanEnv,
-      cwd,
+      cwd: threadCwd,
     });
 
     // For multimodal messages, write content blocks to stdin
