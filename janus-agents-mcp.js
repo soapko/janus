@@ -81,7 +81,7 @@ async function main() {
       {
         name: 'send_to_agent',
         description:
-          'Send a message to another Janus agent by name. The message is delivered as an interjection — the target agent\'s current work is interrupted and it sees your message as a new user turn. Returns immediately (non-blocking). The target agent will process your message independently.',
+          'Send a message to another Janus agent by name. The message is delivered as an interjection — the target agent\'s current work is interrupted and it sees your message as a new user turn. Returns immediately (non-blocking). The target agent will process your message independently. If the target agent doesn\'t have an open tab, one will be created automatically.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -95,6 +95,21 @@ async function main() {
             },
           },
           required: ['target', 'message'],
+        },
+      },
+      {
+        name: 'open_chat_tab',
+        description:
+          'Open a new cumulus chat tab with a specific thread name. If a tab with that thread name already exists, returns it without creating a duplicate. Use this to spawn a new agent before sending it messages.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            threadName: {
+              type: 'string',
+              description: 'The thread name for the new chat tab (becomes the agent\'s identity)',
+            },
+          },
+          required: ['threadName'],
         },
       },
     ],
@@ -141,11 +156,48 @@ async function main() {
         };
       }
 
-      const result = await apiRequest('POST', `/api/agents/${encodeURIComponent(target)}/message`, {
+      // Try to send the message
+      let result = await apiRequest('POST', `/api/agents/${encodeURIComponent(target)}/message`, {
         message,
         sender: AGENT_NAME,
       });
 
+      // If agent not found, auto-open a chat tab for it and retry
+      if (result.error && result.error.includes('not found')) {
+        const createResult = await apiRequest('POST', '/api/agents', { threadName: target });
+        if (createResult.error) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ delivered: false, error: `Failed to auto-create agent tab: ${createResult.error}` }) }],
+            isError: true,
+          };
+        }
+
+        // Wait briefly for the tab to initialize (React mount + thread creation)
+        await new Promise(resolve => setTimeout(resolve, 2000));
+
+        // Retry the message
+        result = await apiRequest('POST', `/api/agents/${encodeURIComponent(target)}/message`, {
+          message,
+          sender: AGENT_NAME,
+        });
+      }
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify(result) }],
+        isError: !!result.error,
+      };
+    }
+
+    if (name === 'open_chat_tab') {
+      const { threadName } = args;
+      if (!threadName) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ error: 'Missing threadName' }) }],
+          isError: true,
+        };
+      }
+
+      const result = await apiRequest('POST', '/api/agents', { threadName });
       return {
         content: [{ type: 'text', text: JSON.stringify(result) }],
         isError: !!result.error,

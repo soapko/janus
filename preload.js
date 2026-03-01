@@ -77,6 +77,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   cumulusGetTurns: (thread) => ipcRenderer.invoke('cumulus:get-turns', thread),
   cumulusRevert: (thread, messageId, restoreGit) => ipcRenderer.invoke('cumulus:revert', thread, messageId, restoreGit),
 
+  // Cumulus tab creation (reverse IPC from main process)
+  onCreateCumulusTab: (callback) => ipcRenderer.on('janus:create-cumulus-tab', (_, data) => callback(data)),
+
   // Active tab tracking
   setActiveCumulusTab: (threadName) => ipcRenderer.send('janus:active-cumulus-tab', threadName),
   clearActiveCumulusTab: () => ipcRenderer.send('janus:active-cumulus-tab', null),

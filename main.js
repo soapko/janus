@@ -462,6 +462,38 @@ function startHttpApi() {
 
     // ===== AGENT MESSAGING ENDPOINTS =====
 
+    // POST /api/agents — create a new cumulus chat tab (agent)
+    if (req.method === 'POST' && segments[0] === 'api' && segments[1] === 'agents' && !segments[2]) {
+      const body = await readBody(req);
+      const threadName = body.threadName;
+      if (!threadName) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: 'Missing threadName' }));
+        return;
+      }
+
+      // Check if agent already exists
+      for (const [, bridge] of windowBridges) {
+        if (bridge.threads.has(threadName)) {
+          res.writeHead(200);
+          res.end(JSON.stringify({ created: false, threadName, reason: 'already exists' }));
+          return;
+        }
+      }
+
+      // Create the tab via reverse IPC to renderer
+      const result = await sendToRenderer('janus:create-cumulus-tab', { threadName });
+      if (!result) {
+        res.writeHead(500);
+        res.end(JSON.stringify({ error: 'Failed to create tab (renderer timeout or no window)' }));
+        return;
+      }
+
+      res.writeHead(201);
+      res.end(JSON.stringify({ created: true, threadName: result.threadName, tabId: result.tabId }));
+      return;
+    }
+
     // GET /api/agents — list all active cumulus agents across all windows
     if (req.method === 'GET' && segments[0] === 'api' && segments[1] === 'agents' && !segments[2]) {
       const agents = [];

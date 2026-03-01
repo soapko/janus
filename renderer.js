@@ -1628,6 +1628,12 @@ window.electronAPI.onCloseWebTab(({ requestId, tabId }) => {
 });
 
 
+// ===== CUMULUS TAB CREATION (reverse IPC from main process) =====
+window.electronAPI.onCreateCumulusTab(({ requestId, threadName }) => {
+  const tabId = createCumulusTab(threadName);
+  window.electronAPI.sendWebTabResult(requestId, { tabId, threadName });
+});
+
 // ===== UNREAD TAB BADGE =====
 window.electronAPI.onTabUnread(({ threadName }) => {
   // Find the cumulus tab with this thread name
