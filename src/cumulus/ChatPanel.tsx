@@ -1,5 +1,5 @@
 import React, { Component, useCallback, useEffect, useRef, useState } from 'react';
-import { Attachment, CumulusChatAPI, Message } from './types';
+import { Attachment, CumulusChatAPI, Message, StreamSegment } from './types';
 import ChatInput from './ChatInput';
 import MessageBubble from './MessageBubble';
 import StreamingResponse from './StreamingResponse';
@@ -52,10 +52,16 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
   const [threads, setThreads] = useState<string[]>([]);
   const [showThreadPicker, setShowThreadPicker] = useState(false);
   const [overlay, setOverlay] = useState<OverlayMode>(null);
+  const [streamSegments, setStreamSegments] = useState<StreamSegment[]>([]);
+  const [showVerbose, setShowVerbose] = useState<boolean>(() => {
+    try { return localStorage.getItem('cumulus:showVerbose') === 'true'; } catch { return false; }
+  });
 
   const scrollAnchorRef = useRef<HTMLDivElement>(null);
   const messageListRef = useRef<HTMLDivElement>(null);
   const streamBufferRef = useRef('');
+  const streamSegmentsRef = useRef<StreamSegment[]>([]);
+  const streamCapturedRef = useRef(false);
 
   const scrollToBottom = useCallback(() => {
     requestAnimationFrame(() => {
@@ -146,10 +152,34 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
     });
     tryRegisterCleanup(chunkResult);
 
+    const segmentResult = api.onStreamSegment((data) => {
+      if (data.threadName !== threadName) return;
+      setStreamSegments((prev) => {
+        const next = [...prev, data.segment];
+        streamSegmentsRef.current = next;
+        return next;
+      });
+      scrollToBottom();
+    });
+    tryRegisterCleanup(segmentResult);
+
     const streamEndResult = api.onStreamEnd((data) => {
       if (data.threadName !== threadName) return;
 
+      // If the stream was already captured by an interjection, suppress the
+      // duplicate — the partial text was frozen inline before the user message
+      if (streamCapturedRef.current) {
+        streamCapturedRef.current = false;
+        setIsStreaming(false);
+        setStreamBuffer('');
+        streamBufferRef.current = '';
+        setStreamSegments([]);
+        streamSegmentsRef.current = [];
+        return;
+      }
+
       const currentBuffer = streamBufferRef.current;
+      const currentSegments = data.segments || streamSegmentsRef.current;
 
       console.log('[ChatPanel] onStreamEnd received:', {
         hasMessage: !!data.message,
@@ -159,11 +189,14 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
         hasFallbackText: !!data.fallbackText,
         fallbackTextLength: data.fallbackText?.length,
         currentBufferLength: currentBuffer.length,
+        segmentCount: currentSegments.length,
       });
 
       setIsStreaming(false);
       setStreamBuffer('');
       streamBufferRef.current = '';
+      setStreamSegments([]);
+      streamSegmentsRef.current = [];
 
       const msg = data.message;
       const isValidMessage =
@@ -176,10 +209,13 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
 
       if (isValidMessage) {
         console.log('[ChatPanel] onStreamEnd: adding valid message, id =', msg.id);
+        const messageWithSegments = currentSegments.length > 0
+          ? { ...msg, segments: currentSegments }
+          : msg;
         setMessages((prev) => {
           const exists = prev.some((m) => m.id === msg.id);
           if (exists) return prev;
-          return [...prev, msg];
+          return [...prev, messageWithSegments];
         });
         scrollToBottom();
       } else {
@@ -191,6 +227,7 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
             role: 'assistant',
             content: text,
             timestamp: Date.now(),
+            segments: currentSegments.length > 0 ? currentSegments : undefined,
           };
           setMessages((prev) => [...prev, synthetic]);
           scrollToBottom();
@@ -220,6 +257,34 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
   const handleSend = useCallback(
     (text: string, attachments: Attachment[]) => {
       setError(null);
+
+      // If interjecting during streaming, freeze the partial response first
+      // so it appears ABOVE the user's interjection in the message list
+      if (isStreaming) {
+        const partialText = streamBufferRef.current;
+        const partialSegments = [...streamSegmentsRef.current];
+
+        // Clear streaming state immediately
+        setIsStreaming(false);
+        setStreamBuffer('');
+        streamBufferRef.current = '';
+        setStreamSegments([]);
+        streamSegmentsRef.current = [];
+        streamCapturedRef.current = true;
+
+        // Add partial assistant message if there was any streamed text
+        if (partialText) {
+          const partial: Message = {
+            id: `_partial_${Date.now()}`,
+            role: 'assistant',
+            content: partialText,
+            timestamp: Date.now(),
+            segments: partialSegments.length > 0 ? partialSegments : undefined,
+          };
+          setMessages((prev) => [...prev, partial]);
+        }
+      }
+
       api.sendMessage(text, attachments);
       const optimistic: Message = {
         id: `_opt_${Date.now()}`,
@@ -231,7 +296,7 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
       setMessages((prev) => [...prev, optimistic]);
       scrollToBottom();
     },
-    [api, scrollToBottom],
+    [api, isStreaming, scrollToBottom],
   );
 
   const handleKill = useCallback(() => {
@@ -262,6 +327,14 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
     loadHistory();
   }, [loadHistory]);
 
+  const handleToggleVerbose = useCallback(() => {
+    setShowVerbose((prev) => {
+      const next = !prev;
+      try { localStorage.setItem('cumulus:showVerbose', String(next)); } catch {}
+      return next;
+    });
+  }, []);
+
   const handleLoadThreads = useCallback(() => {
     api.listThreads().then(setThreads).catch(() => {});
     setShowThreadPicker((prev) => !prev);
@@ -270,12 +343,20 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
   const isEmpty = messages.length === 0 && !isStreaming && !isLoading;
 
   return (
-    <div className="chat-panel">
+    <div className={`chat-panel${showVerbose ? ' chat-panel--verbose' : ''}`}>
       <div className="chat-header">
         <div className="chat-header__thread-info">
           <span className="chat-header__thread-name">{api.threadName}</span>
         </div>
         <div className="chat-header__actions">
+          <button
+            className={`chat-header__btn${showVerbose ? ' chat-header__btn--active' : ''}`}
+            onClick={handleToggleVerbose}
+            type="button"
+            title={showVerbose ? 'Hide details' : 'Show details'}
+          >
+            {showVerbose ? 'Hide details' : 'Details'}
+          </button>
           <button
             className="chat-header__btn"
             onClick={handleLoadThreads}
@@ -291,6 +372,15 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
               <div
                 key={t}
                 className={`chat-thread-picker__item ${t === api.threadName ? 'chat-thread-picker__item--active' : ''}`}
+                onClick={() => {
+                  if (t === api.threadName) {
+                    setShowThreadPicker(false);
+                    return;
+                  }
+                  setShowThreadPicker(false);
+                  api.switchThread(t);
+                }}
+                style={{ cursor: 'pointer' }}
               >
                 {t}
               </div>
@@ -323,8 +413,8 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
             </MessageErrorBoundary>
           ))}
 
-          {isStreaming && streamBuffer.length > 0 && (
-            <StreamingResponse text={streamBuffer} />
+          {isStreaming && (streamBuffer.length > 0 || streamSegments.length > 0) && (
+            <StreamingResponse text={streamBuffer} segments={streamSegments} />
           )}
 
           {error && (

@@ -1,3 +1,11 @@
+export type StreamSegment =
+  | { type: 'text'; content: string }
+  | { type: 'thinking'; content: string }
+  | { type: 'tool_use'; tool: string; input: Record<string, unknown> }
+  | { type: 'tool_result'; content: string; isError: boolean }
+  | { type: 'system'; content: string }
+  | { type: 'result'; duration_ms?: number; usage?: { input_tokens: number; output_tokens: number } };
+
 export interface Message {
   /** Unique identifier — nanoid from cumulus HistoryStore */
   id: string;
@@ -8,6 +16,8 @@ export interface Message {
   tokenCount?: number;
   metadata?: Record<string, unknown>;
   attachments?: Attachment[];
+  /** Verbose stream segments — ephemeral, not persisted to JSONL */
+  segments?: StreamSegment[];
 }
 
 export interface Attachment {
@@ -47,7 +57,8 @@ export interface CumulusChatAPI {
   pickFiles: () => Promise<Attachment[]>;
   onMessage: (callback: (data: { threadName: string; message: Message }) => void) => void;
   onStreamChunk: (callback: (data: { threadName: string; text: string }) => void) => void;
-  onStreamEnd: (callback: (data: { threadName: string; message: Message | null; fallbackText?: string | null }) => void) => void;
+  onStreamSegment: (callback: (data: { threadName: string; segment: StreamSegment }) => void) => void;
+  onStreamEnd: (callback: (data: { threadName: string; message: Message | null; fallbackText?: string | null; segments?: StreamSegment[] }) => void) => void;
   onError: (callback: (data: { threadName: string; error: string }) => void) => void;
   // Slash command APIs
   listIncludeFiles: () => Promise<IncludeFileInfo[]>;
@@ -56,4 +67,5 @@ export interface CumulusChatAPI {
   getTurns: () => Promise<TurnInfo[]>;
   revert: (messageId: string, restoreGit: boolean) => Promise<RevertResult>;
   closeTab: () => void;
+  switchThread: (newThreadName: string) => void;
 }

@@ -43,6 +43,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('cumulus:stream-chunk', handler);
     return () => ipcRenderer.removeListener('cumulus:stream-chunk', handler);
   },
+  onCumulusStreamSegment: (callback) => {
+    const handler = (_, data) => callback(data);
+    ipcRenderer.on('cumulus:stream-segment', handler);
+    return () => ipcRenderer.removeListener('cumulus:stream-segment', handler);
+  },
   onCumulusStreamEnd: (callback) => {
     const handler = (_, data) => callback(data);
     ipcRenderer.on('cumulus:stream-end', handler);
@@ -54,10 +59,26 @@ contextBridge.exposeInMainWorld('electronAPI', {
     return () => ipcRenderer.removeListener('cumulus:error', handler);
   },
 
+  // Web tab control (for external automation tools)
+  openWebTab: (url) => ipcRenderer.invoke('janus:open-web-tab', url),
+  listWebTabs: () => ipcRenderer.invoke('janus:list-web-tabs'),
+  navigateWebTab: (tabId, url) => ipcRenderer.invoke('janus:navigate-web-tab', tabId, url),
+  onOpenWebTab: (callback) => ipcRenderer.on('janus:open-web-tab', (_, data) => callback(data)),
+  onListWebTabs: (callback) => ipcRenderer.on('janus:list-web-tabs', (_, data) => callback(data)),
+  onNavigateWebTab: (callback) => ipcRenderer.on('janus:navigate-web-tab', (_, data) => callback(data)),
+  closeWebTab: (tabId) => ipcRenderer.invoke('janus:close-web-tab', tabId),
+  onCloseWebTab: (callback) => ipcRenderer.on('janus:close-web-tab', (_, data) => callback(data)),
+  sendWebTabResult: (requestId, result) => ipcRenderer.send('janus:web-tab-result', { requestId, result }),
+
   // Slash command APIs
   cumulusListIncludeFiles: (thread) => ipcRenderer.invoke('cumulus:list-include-files', thread),
   cumulusAddIncludeFile: (thread, filePath, scope) => ipcRenderer.invoke('cumulus:add-include-file', thread, filePath, scope),
   cumulusRemoveIncludeFile: (thread, filePath, scope) => ipcRenderer.invoke('cumulus:remove-include-file', thread, filePath, scope),
   cumulusGetTurns: (thread) => ipcRenderer.invoke('cumulus:get-turns', thread),
   cumulusRevert: (thread, messageId, restoreGit) => ipcRenderer.invoke('cumulus:revert', thread, messageId, restoreGit),
+
+  // Active tab tracking
+  setActiveCumulusTab: (threadName) => ipcRenderer.send('janus:active-cumulus-tab', threadName),
+  clearActiveCumulusTab: () => ipcRenderer.send('janus:active-cumulus-tab', null),
+  onTabUnread: (callback) => ipcRenderer.on('janus:tab-unread', (_, data) => callback(data)),
 });

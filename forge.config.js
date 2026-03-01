@@ -13,9 +13,10 @@ module.exports = {
     executableName: 'Janus',
     appBundleId: 'com.karl.janus',
     appCategoryType: 'public.app-category.developer-tools',
-    asar: {
-      unpack: '**/{*.node,*.onnx,node-pty/**/*,onnxruntime-node/**/*,sharp/**/*,@moonshine-ai/**/*}'
-    },
+    // Asar disabled — MCP server scripts (cumulus-history, janus-agents) need to be
+    // readable by regular node processes spawned by Claude CLI, which can't read from
+    // inside .asar archives. Disabling asar ensures all paths just work.
+    asar: false,
     // Resolve symlinked dependencies (e.g. cumulus via file:../cumulus) before ASAR packaging.
     // The symlink in the temp build dir points to a relative path that doesn't exist,
     // so we resolve the real path from the source project at config-load time.
@@ -29,10 +30,23 @@ module.exports = {
           fs.mkdirSync(cumulusLink, { recursive: true });
           fs.cpSync(path.join(CUMULUS_REAL_PATH, 'dist'), path.join(cumulusLink, 'dist'), { recursive: true });
           fs.copyFileSync(path.join(CUMULUS_REAL_PATH, 'package.json'), path.join(cumulusLink, 'package.json'));
-          // Copy cumulus node_modules if they exist (for cumulus's own deps)
+          // Copy only essential cumulus node_modules (skip large/problematic ones like pdfjs-dist)
           const nmSrc = path.join(CUMULUS_REAL_PATH, 'node_modules');
           if (fs.existsSync(nmSrc)) {
-            fs.cpSync(nmSrc, path.join(cumulusLink, 'node_modules'), { recursive: true });
+            const nmDst = path.join(cumulusLink, 'node_modules');
+            fs.mkdirSync(nmDst, { recursive: true });
+            const entries = fs.readdirSync(nmSrc);
+            const skipList = new Set(['.cache', '.package-lock.json']);
+            for (const entry of entries) {
+              if (skipList.has(entry)) continue;
+              const srcPath = path.join(nmSrc, entry);
+              const dstPath = path.join(nmDst, entry);
+              try {
+                fs.cpSync(srcPath, dstPath, { recursive: true });
+              } catch (e) {
+                console.warn(`[forge] Skipped cumulus dep ${entry}: ${e.message}`);
+              }
+            }
           }
           console.log('[forge] Resolved cumulus symlink -> copied dist + package.json');
         }
@@ -61,10 +75,10 @@ module.exports = {
     // Uncomment and add path when you have an icon
     // icon: './assets/icon',
 
-    // Sign with Apple Developer certificate
-    osxSign: {
-      identity: 'Apple Development: Karl Tiedemann (762ZX5X3W2)',
-    },
+    // Sign with Apple Developer certificate (disabled temporarily — re-enable with asar)
+    // osxSign: {
+    //   identity: 'Apple Development: Karl Tiedemann (762ZX5X3W2)',
+    // },
     // osxNotarize: {
     //   appleId: process.env.APPLE_ID,
     //   appleIdPassword: process.env.APPLE_PASSWORD,
@@ -95,10 +109,7 @@ module.exports = {
     },
   ],
   plugins: [
-    {
-      name: '@electron-forge/plugin-auto-unpack-natives',
-      config: {},
-    },
+    // auto-unpack-natives removed — not needed with asar: false
     // Fuses disabled for now - they modify binaries and cause signature issues
     // Re-enable when you have proper code signing set up
     // new FusesPlugin({

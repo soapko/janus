@@ -1,6 +1,7 @@
 import React from 'react';
 import { Attachment, Message } from './types';
 import MarkdownRenderer from './MarkdownRenderer';
+import { renderSegmentGroups } from './StreamingResponse';
 
 interface MessageBubbleProps {
   message: Message;
@@ -55,6 +56,7 @@ export default function MessageBubble({ message }: MessageBubbleProps): React.Re
   const hasAttachments = isUser && message.attachments && message.attachments.length > 0;
   const hasText = message.content.trim().length > 0;
   const isRichUser = isUser && hasRichContent(message.content);
+  const hasVerboseSegments = !isUser && message.segments && message.segments.some((s) => s.type !== 'text');
 
   const bubbleClass = isRichUser || hasAttachments
     ? 'message-bubble message-bubble--user message-bubble--user-rich'
@@ -66,13 +68,15 @@ export default function MessageBubble({ message }: MessageBubbleProps): React.Re
         {hasAttachments && (
           <AttachmentBlock attachments={message.attachments!} />
         )}
-        {hasText && (
+        {hasVerboseSegments ? (
+          renderSegmentGroups(message.segments!)
+        ) : hasText ? (
           isUser && !isRichUser && !hasAttachments ? (
             <p className="message-bubble__user-text">{message.content}</p>
           ) : (
             <MarkdownRenderer content={message.content} />
           )
-        )}
+        ) : null}
       </div>
       {timeLabel && (
         <div className="message-bubble__timestamp" aria-label={`Sent at ${timeLabel}`}>

@@ -62,6 +62,33 @@ function resolveClaudeCli() {
   return 'claude'; // fallback to PATH lookup
 }
 
+/**
+ * Resolve the full path to `node`.
+ * When launched from Finder, the PATH is minimal (/usr/bin:/bin:/usr/sbin:/sbin).
+ */
+function resolveNode() {
+  const candidates = [
+    '/usr/local/bin/node',
+    '/opt/homebrew/bin/node',
+    path.join(os.homedir(), '.nvm/versions/node', 'current', 'bin/node'),
+    '/usr/bin/node',
+  ];
+  // Also check NVM versions directory for any installed node
+  const nvmDir = path.join(os.homedir(), '.nvm/versions/node');
+  try {
+    const versions = fs.readdirSync(nvmDir).sort().reverse();
+    for (const v of versions) {
+      candidates.push(path.join(nvmDir, v, 'bin/node'));
+    }
+  } catch {
+    // No NVM installed
+  }
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return 'node'; // fallback to PATH lookup
+}
+
 // Lazy-loaded Cumulus modules (ESM)
 let cumulus = null;
 
@@ -134,22 +161,32 @@ function generateSystemPrompt(count, tokens, sessionId, recentMessages, retrieve
     .replace('{retrievedContext}', retrievedContext);
 }
 
-function generateMcpConfig(threadPath, sessionId) {
+function generateMcpConfig(threadPath, sessionId, agentName) {
   // Point to the cumulus MCP server in node_modules
   const mcpServerPath = path.resolve(__dirname, 'node_modules/cumulus/dist/mcp/index.js');
+  const agentsMcpPath = path.resolve(__dirname, 'janus-agents-mcp.js');
   const contentStorePath = getContentStorePath(threadPath);
   const sessionsPath = getSessionsPath(threadPath);
+  const nodePath = resolveNode();
 
   const config = {
     mcpServers: {
       'cumulus-history': {
-        command: 'node',
+        command: nodePath,
         args: [mcpServerPath],
         env: {
           CUMULUS_THREAD_PATH: threadPath,
           CUMULUS_CONTENT_PATH: contentStorePath,
           CUMULUS_SESSIONS_PATH: sessionsPath,
           ...(sessionId && { CUMULUS_SESSION_ID: sessionId }),
+        },
+      },
+      'janus-agents': {
+        command: nodePath,
+        args: [agentsMcpPath],
+        env: {
+          JANUS_API_URL: 'http://localhost:9223',
+          JANUS_AGENT_NAME: agentName || '',
         },
       },
     },
@@ -168,6 +205,77 @@ function cleanupMcpConfig(configPath) {
     }
   } catch {
     // Ignore cleanup errors
+  }
+}
+
+/**
+ * Parse a stream-json line into typed StreamSegment objects.
+ * Returns an array of segments (may be empty if the line isn't relevant).
+ */
+function parseStreamSegments(line) {
+  if (!line.trim()) return [];
+  try {
+    const parsed = JSON.parse(line);
+
+    // Assistant message — may contain text, thinking, tool_use blocks
+    if (parsed.type === 'assistant' && parsed.message?.content) {
+      const segments = [];
+      for (const block of parsed.message.content) {
+        if (block.type === 'text' && block.text) {
+          segments.push({ type: 'text', content: block.text });
+        } else if (block.type === 'thinking' && block.thinking) {
+          segments.push({ type: 'thinking', content: block.thinking });
+        } else if (block.type === 'tool_use') {
+          segments.push({ type: 'tool_use', tool: block.name, input: block.input || {} });
+        } else if (block.type === 'tool_result') {
+          const content = typeof block.content === 'string' ? block.content : JSON.stringify(block.content);
+          segments.push({ type: 'tool_result', content, isError: !!block.is_error });
+        }
+      }
+      return segments;
+    }
+
+    // User message — contains tool_result blocks (Claude CLI stream-json format)
+    if (parsed.type === 'user' && parsed.message?.content) {
+      const segments = [];
+      for (const block of parsed.message.content) {
+        if (block.type === 'tool_result') {
+          const content = typeof block.content === 'string' ? block.content : JSON.stringify(block.content);
+          segments.push({ type: 'tool_result', content, isError: !!block.is_error });
+        }
+      }
+      return segments;
+    }
+
+    // Standalone tool_result event (type field)
+    if (parsed.type === 'tool_result') {
+      const content = typeof parsed.content === 'string'
+        ? parsed.content
+        : (parsed.content ? JSON.stringify(parsed.content) : '');
+      return [{ type: 'tool_result', content, isError: !!parsed.is_error }];
+    }
+
+    // Standalone tool_result event (output field, no type)
+    if (parsed.output !== undefined) {
+      return [{ type: 'tool_result', content: String(parsed.output), isError: false }];
+    }
+
+    // System event
+    if (parsed.type === 'system') {
+      const content = parsed.subtype
+        ? `${parsed.subtype}: ${parsed.message || ''}`
+        : (parsed.message || JSON.stringify(parsed));
+      return [{ type: 'system', content }];
+    }
+
+    // Result / completion event
+    if (parsed.type === 'result') {
+      return [{ type: 'result', duration_ms: parsed.duration_ms, usage: parsed.usage }];
+    }
+
+    return [];
+  } catch {
+    return [];
   }
 }
 
@@ -237,7 +345,7 @@ class CumulusBridge {
     const session = new lib.SessionManager(sessionsPath, threadName);
     await session.initialize();
 
-    const mcpConfigPath = generateMcpConfig(threadPath, session.getSessionId());
+    const mcpConfigPath = generateMcpConfig(threadPath, session.getSessionId(), threadName);
 
     const thread = { history, content, session, mcpConfigPath, threadPath };
     this.threads.set(threadName, thread);
@@ -436,6 +544,7 @@ class CumulusBridge {
     let fullResponse = '';
     let buffer = '';
     const pendingLines = [];
+    const collectedSegments = [];
 
     const processLine = async (line) => {
       if (!line.trim()) return;
@@ -447,6 +556,7 @@ class CumulusBridge {
         processed = { line, modified: false, eventType: 'unknown' };
       }
 
+      // Existing text-only flow (backward compat)
       const text = extractTextFromStreamLine(processed.line);
       if (text) {
         if (fullResponse && !fullResponse.endsWith('\n')) {
@@ -455,6 +565,13 @@ class CumulusBridge {
         }
         fullResponse += text;
         win.webContents.send('cumulus:stream-chunk', { threadName, text });
+      }
+
+      // Structured segments for verbose display
+      const segments = parseStreamSegments(processed.line);
+      for (const seg of segments) {
+        collectedSegments.push(seg);
+        win.webContents.send('cumulus:stream-segment', { threadName, segment: seg });
       }
     };
 
@@ -517,6 +634,7 @@ class CumulusBridge {
               threadName,
               message: assistantMessage,
               fallbackText: fullResponse,
+              segments: collectedSegments,
             });
           } else {
             console.log('[Bridge] handleCompletion: fullResponse is empty, sending null');
@@ -524,6 +642,7 @@ class CumulusBridge {
               threadName,
               message: null,
               fallbackText: null,
+              segments: collectedSegments,
             });
           }
         } catch (err) {
@@ -532,6 +651,7 @@ class CumulusBridge {
             threadName,
             message: null,
             fallbackText: fullResponse || null,
+            segments: collectedSegments,
           });
         }
 
@@ -644,6 +764,40 @@ class CumulusBridge {
         error: err.message || String(err),
       };
     }
+  }
+
+  /**
+   * Inject an inter-agent message into a thread as an interjection.
+   * Kills any active Claude process (interrupting it), then sends
+   * the formatted message through the normal sendMessage flow.
+   */
+  async injectMessage(threadName, messageText, senderName, win) {
+    // Ensure the thread exists
+    await this.getOrCreateThread(threadName);
+
+    // Kill active subprocess (interjection)
+    if (this.activeProcesses.has(threadName)) {
+      this.killProcess(threadName);
+      // Brief delay to let process clean up
+      await new Promise(r => setTimeout(r, 100));
+    }
+
+    const formatted = `[From agent "${senderName}"]:\n${messageText}\n\n(Reply using send_to_agent("${senderName}", your_response) to respond directly)`;
+    return this.sendMessage(threadName, formatted, win);
+  }
+
+  /**
+   * Returns list of active agent threads with their status.
+   */
+  getActiveAgents() {
+    const agents = [];
+    for (const [threadName] of this.threads) {
+      agents.push({
+        name: threadName,
+        status: this.activeProcesses.has(threadName) ? 'streaming' : 'idle',
+      });
+    }
+    return agents;
   }
 
   destroy() {

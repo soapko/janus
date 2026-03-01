@@ -41,3 +41,24 @@
   - Mic button in chat input with recording state indicator
   - Streaming transcription with VAD (auto-detects speech pauses)
   - Microphone permission handling in Electron
+
+- [◒] 017: Web panel CDP/Playwright integration -> [017-web-panel-cdp-integration.md](docs/tasks/017-web-panel-cdp-integration.md)
+  - IPC commands: `openWebTab`, `listWebTabs`, `navigateWebTab`
+  - CDP already exposed on port 9222, webview targets discoverable
+  - Enables Playwright/Puppet/Abra to automate web panel content
+
+- [◒] 018a: Fix thread selector -> [018a-fix-thread-selector.md](docs/tasks/018a-fix-thread-selector.md)
+  - Thread picker dropdown exists but clicking does nothing
+  - Add switchThread: kill subprocess, swap threadName, remount React
+  - Prerequisite for 018b (need to switch between agent threads)
+
+- [◒] 018b: Inter-agent messaging PoC -> [018b-inter-agent-messaging-poc.md](docs/tasks/018b-inter-agent-messaging-poc.md)
+  - Each cumulus tab is addressable agent (identity = thread name)
+  - HTTP API: `GET /api/agents`, `POST /api/agents/:name/message`
+  - `janus-agents` MCP server with `list_agents` + `send_to_agent`
+  - Message injection via interjection (kill + resend)
+
+- [ ] 018: Inter-agent messaging (full) -> [018-inter-agent-messaging.md](docs/tasks/018-inter-agent-messaging.md)
+  - Broadcast, set_tab_name, rate limiting, agent status tracking
+  - Agent message visual styling (colored borders, badges)
+  - Multi-project support, agent spawning

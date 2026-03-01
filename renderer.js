@@ -628,6 +628,7 @@ function mountCumulusReact(tab, container, threadName) {
       pickFiles: () => window.electronAPI.pickFiles(),
       onMessage: (cb) => window.electronAPI.onCumulusMessage(cb),
       onStreamChunk: (cb) => window.electronAPI.onCumulusStreamChunk(cb),
+      onStreamSegment: (cb) => window.electronAPI.onCumulusStreamSegment(cb),
       onStreamEnd: (cb) => window.electronAPI.onCumulusStreamEnd(cb),
       onError: (cb) => window.electronAPI.onCumulusError(cb),
       // Slash command APIs
@@ -644,6 +645,21 @@ function mountCumulusReact(tab, container, threadName) {
             break;
           }
         }
+      },
+      switchThread: (newThreadName) => {
+        // Kill current subprocess
+        window.electronAPI.cumulusKill(threadName);
+        // Unmount React root
+        if (tab.typeState.reactRoot) {
+          tab.typeState.reactRoot.unmount();
+          tab.typeState.reactRoot = null;
+        }
+        // Clear container
+        container.innerHTML = '';
+        // Update thread name
+        tab.typeState.threadName = newThreadName;
+        // Remount with new thread
+        mountCumulusReact(tab, container, newThreadName);
       },
     };
     tab.typeState.reactRoot = window.mountCumulusChat(container, api);
@@ -664,13 +680,23 @@ function activateTab(id) {
     }
     if (tid === id) {
       tab.tabEl.classList.add('active');
+      // Clear unread badge when tab is activated
+      const badge = tab.tabEl.querySelector('.tab-unread');
+      if (badge) badge.remove();
     } else {
       tab.tabEl.classList.remove('active');
     }
   }
 
-  // Sync URL input if active tab is web
+  // Report active cumulus thread to main process
   const tab = tabs.get(id);
+  if (tab && tab.type === 'cumulus') {
+    window.electronAPI.setActiveCumulusTab(tab.typeState.threadName);
+  } else {
+    window.electronAPI.clearActiveCumulusTab();
+  }
+
+  // Sync URL input if active tab is web
   if (tab && tab.type === 'web') {
     const { webview, urlInput } = tab.typeState;
     try {
@@ -1547,6 +1573,69 @@ window.electronAPI.onCloseTab(() => {
 // ===== NEW TAB HANDLER (from menu Cmd+T) =====
 window.electronAPI.onNewTab(() => {
   createTerminalTab();
+});
+
+
+// ===== WEB TAB CONTROL (for external automation tools) =====
+
+window.electronAPI.onOpenWebTab(({ requestId, url }) => {
+  const tabId = createWebTab(url || 'http://localhost:3000');
+  window.electronAPI.sendWebTabResult(requestId, { tabId, url: url || 'http://localhost:3000' });
+});
+
+window.electronAPI.onListWebTabs(({ requestId }) => {
+  const webTabs = [...tabs.values()]
+    .filter(t => t.type === 'web')
+    .map(t => ({
+      tabId: t.id,
+      url: t.typeState.webview ? t.typeState.webview.getURL() : '',
+      title: t.label
+    }));
+  window.electronAPI.sendWebTabResult(requestId, webTabs);
+});
+
+window.electronAPI.onNavigateWebTab(({ requestId, tabId, url }) => {
+  const tab = tabs.get(tabId);
+  if (tab && tab.type === 'web' && tab.typeState.webview) {
+    let target = url;
+    if (!target.startsWith('http://') && !target.startsWith('https://') && !target.startsWith('file://')) {
+      target = 'https://' + target;
+    }
+    tab.typeState.webview.src = target;
+    window.electronAPI.sendWebTabResult(requestId, { success: true });
+  } else {
+    window.electronAPI.sendWebTabResult(requestId, { success: false });
+  }
+});
+
+window.electronAPI.onCloseWebTab(({ requestId, tabId }) => {
+  const tab = tabs.get(tabId);
+  if (tab && tab.type === 'web') {
+    closeTab(tabId);
+    window.electronAPI.sendWebTabResult(requestId, { success: true });
+  } else {
+    window.electronAPI.sendWebTabResult(requestId, { success: false });
+  }
+});
+
+
+// ===== UNREAD TAB BADGE =====
+window.electronAPI.onTabUnread(({ threadName }) => {
+  // Find the cumulus tab with this thread name
+  for (const [id, tab] of tabs) {
+    if (tab.type === 'cumulus' && tab.typeState.threadName === threadName) {
+      // Don't badge if this tab is already active
+      if (activeTabId === id) return;
+      // Don't add duplicate badge
+      if (tab.tabEl.querySelector('.tab-unread')) return;
+      const badge = document.createElement('span');
+      badge.className = 'tab-unread';
+      // Insert before the close button
+      const closeBtn = tab.tabEl.querySelector('.tab-close');
+      tab.tabEl.insertBefore(badge, closeBtn);
+      break;
+    }
+  }
 });
 
 

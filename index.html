@@ -127,6 +127,21 @@
       opacity: 1;
     }
 
+    /* Unread message badge */
+    .tab-unread {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #ff5252;
+      flex-shrink: 0;
+      animation: tab-unread-pulse 2s ease-in-out infinite;
+    }
+
+    @keyframes tab-unread-pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
     /* Tab drag-to-reorder */
     .tab.tab-dragging {
       opacity: 0.4;

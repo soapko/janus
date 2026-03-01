@@ -2,6 +2,7 @@ const { app, BrowserWindow, ipcMain, dialog, session, Menu, clipboard } = requir
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const http = require('http');
 const pty = require('node-pty');
 const { COLOR_PALETTE, getProjectColor, getProjectColorId, setProjectColor, getColorHex } = require('./projectColors');
 const { CumulusBridge } = require('./cumulus-bridge');
@@ -11,6 +12,8 @@ const windows = new Set();
 const windowPtyProcesses = new Map();
 // Map window ID -> CumulusBridge instance
 const windowBridges = new Map();
+// Map window ID -> active cumulus thread name (reported by renderer)
+const windowActiveCumulusTab = new Map();
 let nextTerminalId = 1;
 
 function updateWindowTitle(win) {
@@ -282,6 +285,292 @@ ipcMain.handle('cumulus:revert', async (event, threadName, messageId, restoreGit
   return bridge.revert(threadName, messageId, restoreGit);
 });
 
+// Track which cumulus tab is active in the renderer
+ipcMain.on('janus:active-cumulus-tab', (event, threadName) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (win) {
+    if (threadName) {
+      windowActiveCumulusTab.set(win.id, threadName);
+    } else {
+      windowActiveCumulusTab.delete(win.id);
+    }
+  }
+});
+
+// ===== WEB TAB CONTROL IPC HANDLERS =====
+
+// Request ID counter for renderer round-trips
+let nextWebTabRequestId = 1;
+const pendingWebTabRequests = new Map();
+
+ipcMain.handle('janus:open-web-tab', (event, url) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win) return null;
+  const requestId = nextWebTabRequestId++;
+  return new Promise((resolve) => {
+    pendingWebTabRequests.set(requestId, resolve);
+    win.webContents.send('janus:open-web-tab', { requestId, url });
+    // Timeout after 5s
+    setTimeout(() => {
+      if (pendingWebTabRequests.has(requestId)) {
+        pendingWebTabRequests.delete(requestId);
+        resolve(null);
+      }
+    }, 5000);
+  });
+});
+
+ipcMain.handle('janus:list-web-tabs', (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win) return [];
+  const requestId = nextWebTabRequestId++;
+  return new Promise((resolve) => {
+    pendingWebTabRequests.set(requestId, resolve);
+    win.webContents.send('janus:list-web-tabs', { requestId });
+    setTimeout(() => {
+      if (pendingWebTabRequests.has(requestId)) {
+        pendingWebTabRequests.delete(requestId);
+        resolve([]);
+      }
+    }, 5000);
+  });
+});
+
+ipcMain.handle('janus:navigate-web-tab', (event, tabId, url) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win) return { success: false };
+  const requestId = nextWebTabRequestId++;
+  return new Promise((resolve) => {
+    pendingWebTabRequests.set(requestId, resolve);
+    win.webContents.send('janus:navigate-web-tab', { requestId, tabId, url });
+    setTimeout(() => {
+      if (pendingWebTabRequests.has(requestId)) {
+        pendingWebTabRequests.delete(requestId);
+        resolve({ success: false });
+      }
+    }, 5000);
+  });
+});
+
+// Renderer sends results back here
+ipcMain.on('janus:web-tab-result', (event, { requestId, result }) => {
+  const resolve = pendingWebTabRequests.get(requestId);
+  if (resolve) {
+    pendingWebTabRequests.delete(requestId);
+    resolve(result);
+  }
+});
+
+ipcMain.handle('janus:close-web-tab', (event, tabId) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win) return { success: false };
+  const requestId = nextWebTabRequestId++;
+  return new Promise((resolve) => {
+    pendingWebTabRequests.set(requestId, resolve);
+    win.webContents.send('janus:close-web-tab', { requestId, tabId });
+    setTimeout(() => {
+      if (pendingWebTabRequests.has(requestId)) {
+        pendingWebTabRequests.delete(requestId);
+        resolve({ success: false });
+      }
+    }, 5000);
+  });
+});
+
+// ===== HTTP API FOR EXTERNAL TOOLS (Playwright/Puppet/Abra) =====
+
+const HTTP_API_PORT = 9223;
+
+function getMainWindow() {
+  const wins = BrowserWindow.getAllWindows();
+  return wins.length > 0 ? wins[0] : null;
+}
+
+function sendToRenderer(channel, data) {
+  return new Promise((resolve) => {
+    const win = getMainWindow();
+    if (!win) return resolve(null);
+    const requestId = nextWebTabRequestId++;
+    pendingWebTabRequests.set(requestId, resolve);
+    win.webContents.send(channel, { requestId, ...data });
+    setTimeout(() => {
+      if (pendingWebTabRequests.has(requestId)) {
+        pendingWebTabRequests.delete(requestId);
+        resolve(null);
+      }
+    }, 5000);
+  });
+}
+
+function startHttpApi() {
+  const server = http.createServer(async (req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    const url = new URL(req.url, `http://localhost:${HTTP_API_PORT}`);
+    const segments = url.pathname.split('/').filter(Boolean); // ['api', 'tabs', ...]
+
+    // GET /api/tabs — list web tabs
+    if (req.method === 'GET' && segments[0] === 'api' && segments[1] === 'tabs' && !segments[2]) {
+      const tabs = await sendToRenderer('janus:list-web-tabs', {});
+      res.writeHead(200);
+      res.end(JSON.stringify(tabs || []));
+      return;
+    }
+
+    // POST /api/tabs — create web tab
+    if (req.method === 'POST' && segments[0] === 'api' && segments[1] === 'tabs' && !segments[2]) {
+      const body = await readBody(req);
+      const { url: tabUrl } = body;
+      const result = await sendToRenderer('janus:open-web-tab', { url: tabUrl });
+      if (result) {
+        res.writeHead(201);
+        res.end(JSON.stringify(result));
+      } else {
+        res.writeHead(500);
+        res.end(JSON.stringify({ error: 'Failed to create tab' }));
+      }
+      return;
+    }
+
+    // POST /api/tabs/:id/navigate — navigate a tab
+    if (req.method === 'POST' && segments[0] === 'api' && segments[1] === 'tabs' && segments[3] === 'navigate') {
+      const tabId = parseInt(segments[2], 10);
+      const body = await readBody(req);
+      const result = await sendToRenderer('janus:navigate-web-tab', { tabId, url: body.url });
+      res.writeHead(200);
+      res.end(JSON.stringify(result || { success: false }));
+      return;
+    }
+
+    // DELETE /api/tabs/:id — close a tab
+    if (req.method === 'DELETE' && segments[0] === 'api' && segments[1] === 'tabs' && segments[2]) {
+      const tabId = parseInt(segments[2], 10);
+      const result = await sendToRenderer('janus:close-web-tab', { tabId });
+      res.writeHead(200);
+      res.end(JSON.stringify(result || { success: false }));
+      return;
+    }
+
+    // ===== AGENT MESSAGING ENDPOINTS =====
+
+    // GET /api/agents — list all active cumulus agents across all windows
+    if (req.method === 'GET' && segments[0] === 'api' && segments[1] === 'agents' && !segments[2]) {
+      const agents = [];
+      const activeThreads = [];
+      for (const [winId, bridge] of windowBridges) {
+        const bridgeAgents = bridge.getActiveAgents();
+        agents.push(...bridgeAgents);
+        const activeThread = windowActiveCumulusTab.get(winId);
+        if (activeThread) activeThreads.push(activeThread);
+      }
+      res.writeHead(200);
+      res.end(JSON.stringify({ agents, activeTab: activeThreads[0] || null }));
+      return;
+    }
+
+    // POST /api/agents/:name/message — deliver message to a specific agent
+    if (req.method === 'POST' && segments[0] === 'api' && segments[1] === 'agents' && segments[3] === 'message') {
+      const targetName = decodeURIComponent(segments[2]);
+      const body = await readBody(req);
+      const { message, sender } = body;
+
+      if (!message || !sender) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ delivered: false, error: 'Missing message or sender' }));
+        return;
+      }
+
+      // Find which bridge owns this thread
+      let targetBridge = null;
+      let targetWin = null;
+      for (const [winId, bridge] of windowBridges) {
+        if (bridge.threads.has(targetName)) {
+          targetBridge = bridge;
+          targetWin = BrowserWindow.fromId(winId);
+          break;
+        }
+      }
+
+      if (!targetBridge || !targetWin) {
+        // Collect available agent names for helpful error
+        const available = [];
+        for (const [, bridge] of windowBridges) {
+          for (const [name] of bridge.threads) {
+            available.push(name);
+          }
+        }
+        res.writeHead(404);
+        res.end(JSON.stringify({ delivered: false, error: `Agent "${targetName}" not found`, available }));
+        return;
+      }
+
+      // Inject the message (non-blocking from the sender's perspective)
+      targetBridge.injectMessage(targetName, message, sender, targetWin).catch(err => {
+        console.error(`[Agent API] injectMessage error for ${targetName}:`, err);
+      });
+
+      // Notify renderer to show unread badge on target tab
+      targetWin.webContents.send('janus:tab-unread', { threadName: targetName });
+
+      res.writeHead(200);
+      res.end(JSON.stringify({ delivered: true, target: targetName }));
+      return;
+    }
+
+    // GET /api/targets — list CDP webview targets (convenience)
+    if (req.method === 'GET' && segments[0] === 'api' && segments[1] === 'targets') {
+      try {
+        const resp = await fetch('http://localhost:9222/json');
+        const targets = await resp.json();
+        const webviews = targets.filter(t => t.type === 'webview');
+        res.writeHead(200);
+        res.end(JSON.stringify(webviews));
+      } catch (e) {
+        res.writeHead(500);
+        res.end(JSON.stringify({ error: 'CDP not available' }));
+      }
+      return;
+    }
+
+    res.writeHead(404);
+    res.end(JSON.stringify({ error: 'Not found' }));
+  });
+
+  server.listen(HTTP_API_PORT, '127.0.0.1', () => {
+    console.log(`Janus HTTP API listening on http://127.0.0.1:${HTTP_API_PORT}`);
+  });
+
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.warn(`Port ${HTTP_API_PORT} in use, trying ${HTTP_API_PORT + 1}`);
+      server.listen(HTTP_API_PORT + 1, '127.0.0.1');
+    }
+  });
+}
+
+function readBody(req) {
+  return new Promise((resolve) => {
+    let data = '';
+    req.on('data', chunk => data += chunk);
+    req.on('end', () => {
+      try {
+        resolve(JSON.parse(data));
+      } catch {
+        resolve({});
+      }
+    });
+  });
+}
+
 // ===== ATTACHMENT IPC HANDLERS =====
 
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg']);
@@ -544,6 +833,7 @@ app.whenReady().then(() => {
   createMenu();
   setupMenuRefresh();
   createWindow();
+  startHttpApi();
 });
 
 app.on('window-all-closed', () => {
