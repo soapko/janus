@@ -1,5 +1,5 @@
 import React from 'react';
-import { Attachment, Message } from './types';
+import { Attachment, Message, StreamSegment } from './types';
 import MarkdownRenderer from './MarkdownRenderer';
 import { renderSegmentGroups } from './StreamingResponse';
 
@@ -77,6 +77,106 @@ function AttachmentBlock({ attachments }: { attachments: Attachment[] }): React.
   );
 }
 
+// ---- Grounding badges ----
+
+interface GroundingSource {
+  type: 'file' | 'search' | 'web' | 'store' | 'command';
+  label: string;
+}
+
+const SOURCE_TOOLS: Record<string, (input: Record<string, unknown>) => GroundingSource | null> = {
+  Read: (input) => {
+    const p = String(input.file_path || '');
+    if (!p) return null;
+    const basename = p.split('/').pop() || p;
+    return { type: 'file', label: basename };
+  },
+  Glob: (input) => {
+    const pattern = String(input.pattern || '');
+    return pattern ? { type: 'search', label: pattern } : null;
+  },
+  Grep: (input) => {
+    const pattern = String(input.pattern || '');
+    return pattern ? { type: 'search', label: `/${pattern}/` } : null;
+  },
+  WebFetch: (input) => {
+    const url = String(input.url || '');
+    if (!url) return null;
+    try {
+      return { type: 'web', label: new URL(url).hostname };
+    } catch {
+      return { type: 'web', label: url.slice(0, 30) };
+    }
+  },
+  WebSearch: (input) => {
+    const query = String(input.query || '');
+    return query ? { type: 'web', label: query.slice(0, 30) } : null;
+  },
+  retrieve_content: (input) => {
+    const id = String(input.contentId || '');
+    return id ? { type: 'store', label: id.slice(0, 16) } : null;
+  },
+  search_content: (input) => {
+    const query = String(input.query || '');
+    return query ? { type: 'store', label: query.slice(0, 30) } : null;
+  },
+  Bash: (input) => {
+    const cmd = String(input.command || '');
+    if (!cmd) return null;
+    const short = cmd.split('\n')[0];
+    return { type: 'command', label: short.length > 30 ? short.slice(0, 27) + '...' : short };
+  },
+};
+
+function extractSources(segments: StreamSegment[]): GroundingSource[] {
+  const sources: GroundingSource[] = [];
+  const seen = new Set<string>();
+
+  for (const seg of segments) {
+    if (seg.type !== 'tool_use') continue;
+    const extractor = SOURCE_TOOLS[seg.tool];
+    if (!extractor) continue;
+    const source = extractor(seg.input);
+    if (!source) continue;
+    const key = `${source.type}:${source.label}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    sources.push(source);
+  }
+
+  return sources;
+}
+
+const SOURCE_ICONS: Record<GroundingSource['type'], string> = {
+  file: '📄',
+  search: '🔍',
+  web: '🌐',
+  store: '📦',
+  command: '⌘',
+};
+
+function GroundingBadges({ sources }: { sources: GroundingSource[] }): React.ReactElement | null {
+  if (sources.length === 0) return null;
+
+  // Show at most 5 badges; collapse the rest
+  const visible = sources.slice(0, 5);
+  const overflowCount = sources.length - visible.length;
+
+  return (
+    <div className="grounding-badges">
+      {visible.map((s, i) => (
+        <span key={i} className={`grounding-badge grounding-badge--${s.type}`} title={s.label}>
+          <span className="grounding-badge__icon">{SOURCE_ICONS[s.type]}</span>
+          <span className="grounding-badge__label">{s.label}</span>
+        </span>
+      ))}
+      {overflowCount > 0 && (
+        <span className="grounding-badge grounding-badge--overflow">+{overflowCount}</span>
+      )}
+    </div>
+  );
+}
+
 export default function MessageBubble({ message }: MessageBubbleProps): React.ReactElement {
   const isUser = message.role === 'user';
   const timeLabel = formatTimestamp(message.timestamp);
@@ -84,6 +184,9 @@ export default function MessageBubble({ message }: MessageBubbleProps): React.Re
   const hasText = message.content.trim().length > 0;
   const isRichUser = isUser && hasRichContent(message.content);
   const hasVerboseSegments = !isUser && message.segments && message.segments.some((s) => s.type !== 'text');
+
+  // Extract grounding sources from assistant segments
+  const groundingSources = !isUser && message.segments ? extractSources(message.segments) : [];
 
   // Detect inter-agent messages
   const agentInfo = isUser ? parseAgentMessage(message.content) : null;
@@ -125,6 +228,7 @@ export default function MessageBubble({ message }: MessageBubbleProps): React.Re
           )
         ) : null}
       </div>
+      {groundingSources.length > 0 && <GroundingBadges sources={groundingSources} />}
       {timeLabel && (
         <div className="message-bubble__timestamp" aria-label={`Sent at ${timeLabel}`}>
           {timeLabel}

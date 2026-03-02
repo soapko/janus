@@ -319,8 +319,9 @@ function mapMessageForRenderer(msg) {
 }
 
 class CumulusBridge {
-  constructor(projectPath) {
+  constructor(projectPath, windowId = null) {
     this.projectPath = projectPath;
+    this.windowId = windowId;
     this.threads = new Map(); // threadName -> { history, content, session, mcpConfigPath }
     this.activeProcesses = new Map(); // threadName -> ChildProcess
   }
@@ -544,12 +545,15 @@ class CumulusBridge {
       args.push(messageForClaude);
     }
 
-    // Filter out Claude env vars
+    // Filter out Claude env vars and inject window ID
     const cleanEnv = Object.fromEntries(
       Object.entries(process.env).filter(
         ([key]) => !key.startsWith('CLAUDE') && key !== 'CLAUDECODE'
       )
     );
+    if (this.windowId != null) {
+      cleanEnv.JANUS_WINDOW_ID = String(this.windowId);
+    }
 
     const claudePath = resolveClaudeCli();
     const claude = spawn(claudePath, args, {

@@ -817,10 +817,40 @@
 .markdown-body a {
   color: #4da6ff;
   text-decoration: none;
+  cursor: pointer;
 }
 
 .markdown-body a:hover {
   text-decoration: underline;
+}
+
+/* Clickable file paths */
+.markdown-body a.clickable-path {
+  color: #8ab4d8;
+  font-family: 'SF Mono', 'Fira Code', Consolas, monospace;
+  font-size: 0.925em;
+  text-decoration: none;
+  border-bottom: 1px dotted #4a6a8a;
+}
+
+.markdown-body a.clickable-path:hover {
+  color: #aad0f0;
+  border-bottom-color: #6a9ac0;
+  text-decoration: none;
+}
+
+/* Clickable inline code (file paths & URLs) */
+.markdown-body code.clickable-path,
+.markdown-body code.clickable-url {
+  cursor: pointer;
+  border-bottom: 1px dotted #4a6a8a;
+}
+
+.markdown-body code.clickable-path:hover,
+.markdown-body code.clickable-url:hover {
+  color: #aad0f0;
+  border-bottom-color: #6a9ac0;
+  background: rgba(138, 180, 216, 0.12);
 }
 
 /* ---- Images ---- */
@@ -1377,4 +1407,76 @@
 .revert-confirm__actions {
   display: flex;
   gap: 0.5em;
+}
+
+/* ============================================================
+   Grounding Badges — show data sources for assistant messages
+   ============================================================ */
+
+.grounding-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3em;
+  margin-top: 0.4em;
+  padding: 0 0.1em;
+}
+
+.grounding-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3em;
+  padding: 0.15em 0.5em;
+  background: #252525;
+  border: 1px solid #333;
+  border-radius: 0.8em;
+  font-size: 0.75em;
+  color: #888;
+  max-width: 18em;
+  overflow: hidden;
+}
+
+.grounding-badge__icon {
+  flex-shrink: 0;
+  font-size: 0.85em;
+  line-height: 1;
+}
+
+.grounding-badge__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: 'SF Mono', 'Fira Code', Consolas, monospace;
+  font-size: 0.925em;
+}
+
+.grounding-badge--file {
+  border-color: #3a4a3a;
+  color: #8bc68b;
+}
+
+.grounding-badge--search {
+  border-color: #4a4a3a;
+  color: #c6c08b;
+}
+
+.grounding-badge--web {
+  border-color: #3a3a4a;
+  color: #8b9ec6;
+}
+
+.grounding-badge--store {
+  border-color: #4a3a4a;
+  color: #b08bc6;
+}
+
+.grounding-badge--command {
+  border-color: #3a3a3a;
+  color: #999;
+}
+
+.grounding-badge--overflow {
+  border-color: #333;
+  color: #666;
+  font-size: 0.7em;
+  padding: 0.2em 0.5em;
 }

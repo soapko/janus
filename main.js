@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, session, Menu, clipboard } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, session, Menu, clipboard, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -53,7 +53,7 @@ function createWindow(projectPath = null) {
   windowPtyProcesses.set(win.id, new Map());
 
   // Initialize Cumulus bridge for this window
-  const bridge = new CumulusBridge(projectPath);
+  const bridge = new CumulusBridge(projectPath, win.id);
   bridge.initialize().catch(err => console.error('[Cumulus] Init error:', err));
   windowBridges.set(win.id, bridge);
 
@@ -90,7 +90,7 @@ function createTerminal(win, cwd = null) {
     cols: 80,
     rows: 24,
     cwd: cwd || win.projectPath || process.env.HOME,
-    env: process.env
+    env: { ...process.env, JANUS_WINDOW_ID: String(win.id) }
   });
 
   // Batch PTY output to reduce IPC frequency during rapid streaming
@@ -386,9 +386,16 @@ function getMainWindow() {
   return wins.length > 0 ? wins[0] : null;
 }
 
-function sendToRenderer(channel, data) {
+function sendToRenderer(channel, data, windowId = null) {
   return new Promise((resolve) => {
-    const win = getMainWindow();
+    // If windowId specified, target that window; otherwise fall back to focused or main
+    let win = null;
+    if (windowId != null) {
+      win = BrowserWindow.fromId(windowId);
+    }
+    if (!win) {
+      win = BrowserWindow.getFocusedWindow() || getMainWindow();
+    }
     if (!win) return resolve(null);
     const requestId = nextWebTabRequestId++;
     pendingWebTabRequests.set(requestId, resolve);
@@ -420,7 +427,8 @@ function startHttpApi() {
 
     // GET /api/tabs — list web tabs
     if (req.method === 'GET' && segments[0] === 'api' && segments[1] === 'tabs' && !segments[2]) {
-      const tabs = await sendToRenderer('janus:list-web-tabs', {});
+      const winId = url.searchParams.get('windowId');
+      const tabs = await sendToRenderer('janus:list-web-tabs', {}, winId ? parseInt(winId, 10) : null);
       res.writeHead(200);
       res.end(JSON.stringify(tabs || []));
       return;
@@ -429,8 +437,8 @@ function startHttpApi() {
     // POST /api/tabs — create web tab
     if (req.method === 'POST' && segments[0] === 'api' && segments[1] === 'tabs' && !segments[2]) {
       const body = await readBody(req);
-      const { url: tabUrl } = body;
-      const result = await sendToRenderer('janus:open-web-tab', { url: tabUrl });
+      const { url: tabUrl, windowId } = body;
+      const result = await sendToRenderer('janus:open-web-tab', { url: tabUrl }, windowId || null);
       if (result) {
         res.writeHead(201);
         res.end(JSON.stringify(result));
@@ -445,7 +453,7 @@ function startHttpApi() {
     if (req.method === 'POST' && segments[0] === 'api' && segments[1] === 'tabs' && segments[3] === 'navigate') {
       const tabId = parseInt(segments[2], 10);
       const body = await readBody(req);
-      const result = await sendToRenderer('janus:navigate-web-tab', { tabId, url: body.url });
+      const result = await sendToRenderer('janus:navigate-web-tab', { tabId, url: body.url }, body.windowId || null);
       res.writeHead(200);
       res.end(JSON.stringify(result || { success: false }));
       return;
@@ -454,7 +462,8 @@ function startHttpApi() {
     // DELETE /api/tabs/:id — close a tab
     if (req.method === 'DELETE' && segments[0] === 'api' && segments[1] === 'tabs' && segments[2]) {
       const tabId = parseInt(segments[2], 10);
-      const result = await sendToRenderer('janus:close-web-tab', { tabId });
+      const body = await readBody(req);
+      const result = await sendToRenderer('janus:close-web-tab', { tabId }, body.windowId || null);
       res.writeHead(200);
       res.end(JSON.stringify(result || { success: false }));
       return;
@@ -482,7 +491,7 @@ function startHttpApi() {
       }
 
       // Create the tab via reverse IPC to renderer
-      const result = await sendToRenderer('janus:create-cumulus-tab', { threadName });
+      const result = await sendToRenderer('janus:create-cumulus-tab', { threadName }, body.windowId || null);
       if (!result) {
         res.writeHead(500);
         res.end(JSON.stringify({ error: 'Failed to create tab (renderer timeout or no window)' }));
@@ -649,6 +658,15 @@ ipcMain.handle('dialog:pick-files', async (event) => {
     const id = `file-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     return { id, name: path.basename(filePath), path: filePath, type: isImage ? 'image' : 'file', mimeType };
   });
+});
+
+// Open URL in default browser or file path in Finder/default app
+ipcMain.handle('shell:open-external', async (_event, url) => {
+  await shell.openExternal(url);
+});
+
+ipcMain.handle('shell:open-path', async (_event, filePath) => {
+  await shell.openPath(filePath);
 });
 
 // Build project color submenu items

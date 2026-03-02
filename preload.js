@@ -84,4 +84,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setActiveCumulusTab: (threadName) => ipcRenderer.send('janus:active-cumulus-tab', threadName),
   clearActiveCumulusTab: () => ipcRenderer.send('janus:active-cumulus-tab', null),
   onTabUnread: (callback) => ipcRenderer.on('janus:tab-unread', (_, data) => callback(data)),
+
+  // Shell open (for clickable paths/URLs)
+  openExternal: (url) => ipcRenderer.invoke('shell:open-external', url),
+  openPath: (filePath) => ipcRenderer.invoke('shell:open-path', filePath),
 });
