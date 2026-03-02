@@ -3,10 +3,6 @@ const { FuseV1Options, FuseVersion } = require('@electron/fuses');
 const fs = require('fs');
 const path = require('path');
 
-// Resolve the cumulus symlink from the SOURCE project (not the temp build dir)
-const SOURCE_DIR = __dirname;
-const CUMULUS_REAL_PATH = fs.realpathSync(path.join(SOURCE_DIR, 'node_modules', 'cumulus'));
-
 module.exports = {
   packagerConfig: {
     name: 'Janus',
@@ -17,43 +13,7 @@ module.exports = {
     // readable by regular node processes spawned by Claude CLI, which can't read from
     // inside .asar archives. Disabling asar ensures all paths just work.
     asar: false,
-    // Resolve symlinked dependencies (e.g. cumulus via file:../cumulus) before ASAR packaging.
-    // The symlink in the temp build dir points to a relative path that doesn't exist,
-    // so we resolve the real path from the source project at config-load time.
     afterCopy: [(buildPath, electronVersion, platform, arch, callback) => {
-      const cumulusLink = path.join(buildPath, 'node_modules', 'cumulus');
-      try {
-        const stat = fs.lstatSync(cumulusLink);
-        if (stat.isSymbolicLink()) {
-          fs.unlinkSync(cumulusLink);
-          // Copy only the files needed for runtime (dist + package.json)
-          fs.mkdirSync(cumulusLink, { recursive: true });
-          fs.cpSync(path.join(CUMULUS_REAL_PATH, 'dist'), path.join(cumulusLink, 'dist'), { recursive: true });
-          fs.copyFileSync(path.join(CUMULUS_REAL_PATH, 'package.json'), path.join(cumulusLink, 'package.json'));
-          // Copy only essential cumulus node_modules (skip large/problematic ones like pdfjs-dist)
-          const nmSrc = path.join(CUMULUS_REAL_PATH, 'node_modules');
-          if (fs.existsSync(nmSrc)) {
-            const nmDst = path.join(cumulusLink, 'node_modules');
-            fs.mkdirSync(nmDst, { recursive: true });
-            const entries = fs.readdirSync(nmSrc);
-            const skipList = new Set(['.cache', '.package-lock.json']);
-            for (const entry of entries) {
-              if (skipList.has(entry)) continue;
-              const srcPath = path.join(nmSrc, entry);
-              const dstPath = path.join(nmDst, entry);
-              try {
-                fs.cpSync(srcPath, dstPath, { recursive: true });
-              } catch (e) {
-                console.warn(`[forge] Skipped cumulus dep ${entry}: ${e.message}`);
-              }
-            }
-          }
-          console.log('[forge] Resolved cumulus symlink -> copied dist + package.json');
-        }
-      } catch (err) {
-        console.warn('[forge] Failed to resolve cumulus symlink:', err.message);
-      }
-
       // Fix broken @ricky0123/vad-web symlink — it's bundled into moonshine.min.js,
       // but the dependency walker needs a resolvable module
       const vadWebLink = path.join(buildPath, 'node_modules', '@ricky0123', 'vad-web');
