@@ -62,3 +62,14 @@
   - Broadcast, set_tab_name, rate limiting, agent status tracking
   - Agent message visual styling (colored borders, badges)
   - Multi-project support, agent spawning
+
+## 019 - UX Polish
+
+- [◒] 019: New tab default thread -> [019-new-tab-default-thread.md](docs/tasks/019-new-tab-default-thread.md)
+  - New chat tabs default to "chat-2" instead of project thread
+  - Cache resolved project folder name, use as default for all new tabs
+
+- [◒] 020: Git branch indicator -> [020-git-branch-indicator.md](docs/tasks/020-git-branch-indicator.md)
+  - Replace thread name indicator with current git branch
+  - Show unsaved changes count (staged + unstaged + untracked)
+  - Poll every 5s, fallback to thread name if not a git repo

@@ -546,14 +546,16 @@ async function createTerminalTab(cwd) {
 
 // ===== CUMULUS TAB =====
 let cumulusTabCounter = 0;
+let defaultThreadName = null;
+let cachedProjectPath = null;
 
 function createCumulusTab(threadName) {
   const id = nextTabId++;
   cumulusTabCounter++;
 
-  // Default thread name based on counter; will be overridden with project name
+  // Default thread name: use cached project name, fallback to counter
   if (!threadName) {
-    threadName = `chat-${cumulusTabCounter}`;
+    threadName = defaultThreadName || `chat-${cumulusTabCounter}`;
   }
 
   const panelEl = document.createElement('div');
@@ -594,6 +596,8 @@ function createCumulusTab(threadName) {
         const folderName = projectPath.split('/').pop() || 'default';
         tab.typeState.threadName = folderName;
         threadName = folderName;
+        defaultThreadName = folderName; // cache for subsequent tabs
+        cachedProjectPath = projectPath; // cache for git queries
         // Update tab label to reflect resolved thread name
         tab.label = folderName;
         const titleEl = tab.tabEl.querySelector('.tab-title');
@@ -650,6 +654,9 @@ function mountCumulusReact(tab, container, threadName) {
           }
         }
       },
+      // Git info
+      gitGetBranch: () => cachedProjectPath ? window.electronAPI.gitGetBranch(cachedProjectPath) : Promise.resolve(null),
+      gitGetStatus: () => cachedProjectPath ? window.electronAPI.gitGetStatus(cachedProjectPath) : Promise.resolve(0),
       switchThread: (newThreadName) => {
         // Kill current subprocess
         window.electronAPI.cumulusKill(threadName);

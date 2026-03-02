@@ -56,6 +56,8 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
   const [showVerbose, setShowVerbose] = useState<boolean>(() => {
     try { return localStorage.getItem('cumulus:showVerbose') === 'true'; } catch { return false; }
   });
+  const [gitBranch, setGitBranch] = useState<string | null>(null);
+  const [gitDirtyCount, setGitDirtyCount] = useState(0);
 
   const scrollAnchorRef = useRef<HTMLDivElement>(null);
   const messageListRef = useRef<HTMLDivElement>(null);
@@ -105,6 +107,17 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
       cancelled = true;
     };
   }, [api, scrollToBottom]);
+
+  // Poll git branch and dirty count
+  useEffect(() => {
+    const refresh = () => {
+      api.gitGetBranch().then(setGitBranch);
+      api.gitGetStatus().then(setGitDirtyCount);
+    };
+    refresh();
+    const interval = setInterval(refresh, 5000);
+    return () => clearInterval(interval);
+  }, [api]);
 
   // Subscribe to IPC events
   useEffect(() => {
@@ -346,7 +359,16 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
     <div className={`chat-panel${showVerbose ? ' chat-panel--verbose' : ''}`}>
       <div className="chat-header">
         <div className="chat-header__thread-info">
-          <span className="chat-header__thread-name">{api.threadName}</span>
+          {gitBranch ? (
+            <>
+              <span className="chat-header__git-branch">{gitBranch}</span>
+              {gitDirtyCount > 0 && (
+                <span className="chat-header__git-dirty">{gitDirtyCount} unsaved</span>
+              )}
+            </>
+          ) : (
+            <span className="chat-header__thread-name">{api.threadName}</span>
+          )}
         </div>
         <div className="chat-header__actions">
           <button

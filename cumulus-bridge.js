@@ -28,21 +28,45 @@ CONTEXT MANAGEMENT:
 - RETRIEVED CONTEXT: Automatically retrieved based on the user's current message using semantic + keyword search.
 - Large content may be stored externally as [STORED:xxx] references.
 
-FALLBACK TOOLS (use only if retrieved context is insufficient):
-- search_history: Search past messages by keyword or meaning
-- peek_recent: Get the last few messages
-- read_messages: Read messages by index range
-- retrieve_content: Get full stored content by [STORED:xxx] ID
-- search_content: Search across all stored content
-
 WORKFLOW:
 1. FIRST use the RETRIEVED CONTEXT above — it was automatically selected for relevance to this query
 2. Check RECENT CONVERSATION for immediate context
 3. Only use tools if the retrieved context doesn't contain what you need
 4. For [STORED:xxx] references, use retrieve_content to get full content
+5. For file reads, use read_file (the built-in Read tool is disabled)
 
 NEVER guess. Use the context provided or retrieve more if needed.
-IMPORTANT: Never mention the retrieval system or tools to the user. Present information naturally.`;
+IMPORTANT: Never mention the retrieval system or tools to the user. Present information naturally.
+
+FILE READING (MANDATORY):
+The built-in Read tool is DISABLED in this environment. You MUST use read_file (MCP tool) for ALL file reads.
+- read_file reads the file, chunks it, embeds it into a vector store, and stores it for persistent retrieval across sessions
+- You receive a summary, content ID, and chunk table-of-contents
+- Use read_content_chunk(contentId, N) to navigate to specific sections
+- Using the built-in Read tool bypasses vector storage and loses context permanently — NEVER use it
+
+TOOL ROUTING (CRITICAL):
+| Need to...          | CORRECT tool      | WRONG tool (do NOT use) |
+|---------------------|-------------------|-------------------------|
+| Read a file         | read_file         | Read                    |
+| Search stored files | search_content    | Grep                    |
+| Get stored content  | retrieve_content  | Read                    |
+
+TOOLS:
+- read_file: Read any file (text or PDF) and store for future retrieval — USE THIS FOR ALL FILE READS
+- store_content: Store arbitrary text content for future retrieval
+- search_history: Search past messages by keyword or meaning
+- peek_recent: Get the last few messages
+- read_messages: Read messages by index range
+- retrieve_content: Get full stored content by [STORED:xxx] ID
+- search_content: Search across all stored content
+- read_content_chunk: Read a specific chunk of stored content by index
+
+STATUS CODES (internal, hidden from user):
+End your response with these codes when applicable. They will be stripped before display.
+- [AWAIT_TASK] - You launched a background task/agent and results are pending. The system will auto-continue.
+- [NEED_INPUT] - You need specific information from the user before proceeding.
+Only use ONE code per response, at the very end. Do not mention these codes to the user.`;
 
 /**
  * Resolve the full path to the `claude` CLI binary.
@@ -526,6 +550,18 @@ class CumulusBridge {
       budget,
       contentStore: thread.content,
     });
+
+    // Prepend system reminder for file reading tools
+    const FILE_READ_REMINDER = `<system-reminder>
+FILE READING: The built-in Read tool is DISABLED. Use read_file for ALL file reads (text, code, PDFs).
+- read_file reads the file, extracts text (including from PDFs), chunks it, embeds it, and stores it for future retrieval
+- You receive a summary, content ID, and chunk table-of-contents
+- Use the TOC to navigate: read_content_chunk("contentId", chunkIndex) for specific sections
+- Use search_content("query") to find content across all stored files
+</system-reminder>
+
+`;
+    messageForClaude = FILE_READ_REMINDER + messageForClaude;
 
     // Spawn Claude
     const args = [

@@ -88,4 +88,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Shell open (for clickable paths/URLs)
   openExternal: (url) => ipcRenderer.invoke('shell:open-external', url),
   openPath: (filePath) => ipcRenderer.invoke('shell:open-path', filePath),
+
+  // Git info
+  gitGetBranch: (cwd) => ipcRenderer.invoke('git:get-branch', cwd),
+  gitGetStatus: (cwd) => ipcRenderer.invoke('git:get-status', cwd),
 });

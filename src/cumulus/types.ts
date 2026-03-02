@@ -68,4 +68,7 @@ export interface CumulusChatAPI {
   revert: (messageId: string, restoreGit: boolean) => Promise<RevertResult>;
   closeTab: () => void;
   switchThread: (newThreadName: string) => void;
+  // Git info
+  gitGetBranch: () => Promise<string | null>;
+  gitGetStatus: () => Promise<number>;
 }

@@ -52,6 +52,19 @@
   color: #ccc;
 }
 
+.chat-header__git-branch {
+  font-size: 0.85em;
+  font-weight: 600;
+  color: #8be9fd;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+}
+
+.chat-header__git-dirty {
+  font-size: 0.75em;
+  color: #f1fa8c;
+  font-weight: 500;
+}
+
 .chat-header__actions {
   display: flex;
   gap: 0.3em;

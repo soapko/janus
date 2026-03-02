@@ -669,6 +669,26 @@ ipcMain.handle('shell:open-path', async (_event, filePath) => {
   await shell.openPath(filePath);
 });
 
+// Git info
+const { execSync } = require('child_process');
+
+ipcMain.handle('git:get-branch', async (_event, cwd) => {
+  try {
+    return execSync('git rev-parse --abbrev-ref HEAD', { cwd, encoding: 'utf8' }).trim();
+  } catch {
+    return null;
+  }
+});
+
+ipcMain.handle('git:get-status', async (_event, cwd) => {
+  try {
+    const output = execSync('git status --porcelain', { cwd, encoding: 'utf8' });
+    return output.split('\n').filter(Boolean).length;
+  } catch {
+    return 0;
+  }
+});
+
 // Build project color submenu items
 function buildProjectColorSubmenu() {
   const focusedWindow = BrowserWindow.getFocusedWindow();
