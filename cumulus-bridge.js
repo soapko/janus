@@ -348,6 +348,7 @@ class CumulusBridge {
     this.windowId = windowId;
     this.threads = new Map(); // threadName -> { history, content, session, mcpConfigPath }
     this.activeProcesses = new Map(); // threadName -> ChildProcess
+    this.messageQueues = new Map(); // threadName -> QueuedMessage[]
   }
 
   async initialize() {
@@ -729,6 +730,9 @@ FILE READING: The built-in Read tool is DISABLED. Use read_file for ALL file rea
         }
 
         resolve(fullResponse);
+
+        // Drain any messages that arrived while this agent was busy
+        this.drainQueue(threadName, win);
       };
 
       claude.on('close', async (code) => {
@@ -840,34 +844,109 @@ FILE READING: The built-in Read tool is DISABLED. Use read_file for ALL file rea
   }
 
   /**
-   * Inject an inter-agent message into a thread as an interjection.
-   * Kills any active Claude process (interrupting it), then sends
-   * the formatted message through the normal sendMessage flow.
+   * Format a single message into prefixed text with reply hint.
    */
-  async injectMessage(threadName, messageText, senderName, win) {
-    // Ensure the thread exists
-    await this.getOrCreateThread(threadName);
+  formatMessage(messageText, senderName, { type = 'direct', targets = null } = {}) {
+    const targetLabel = targets && targets.length > 0 ? targets.join(', ') : '';
 
-    // Kill active subprocess (interjection)
-    if (this.activeProcesses.has(threadName)) {
-      this.killProcess(threadName);
-      // Brief delay to let process clean up
-      await new Promise(r => setTimeout(r, 100));
+    let prefix, replyHint;
+    if (type === 'broadcast') {
+      prefix = `[${senderName} → all]:`;
+      replyHint = `(Reply using send_to_agent("${senderName}", your_response) to respond directly, or broadcast(your_message) to reply to the group. Be concise and task-focused — no pleasantries or sign-offs.)`;
+    } else if (type === 'cc') {
+      prefix = `[${senderName} → ${targetLabel} (CC'd)]:`;
+      replyHint = `(You are CC'd on this message. Only respond if relevant to you. Use send_to_agent to reply. Be concise and task-focused — no pleasantries or sign-offs.)`;
+    } else {
+      prefix = `[${senderName} → ${targetLabel}]:`;
+      replyHint = `(Reply using send_to_agent("${senderName}", your_response) to respond directly. Be concise and task-focused — no pleasantries or sign-offs.)`;
     }
 
-    const formatted = `[From agent "${senderName}"]:\n${messageText}\n\n(Reply using send_to_agent("${senderName}", your_response) to respond directly. Be concise and task-focused — no pleasantries or sign-offs.)`;
-    return this.sendMessage(threadName, formatted, win);
+    return `${prefix}\n${messageText}\n\n${replyHint}`;
   }
 
   /**
-   * Returns list of active agent threads with their status.
+   * Inject an inter-agent message into a thread.
+   * If the agent is idle, delivers immediately (interjection).
+   * If the agent is busy (streaming), queues the message for batch
+   * delivery when the current turn finishes.
+   */
+  async injectMessage(threadName, messageText, senderName, win, { type = 'direct', targets = null } = {}) {
+    await this.getOrCreateThread(threadName);
+
+    const isStreaming = this.activeProcesses.has(threadName);
+
+    if (isStreaming) {
+      // BUSY — queue it, don't kill
+      if (!this.messageQueues.has(threadName)) {
+        this.messageQueues.set(threadName, []);
+      }
+      const queue = this.messageQueues.get(threadName);
+      queue.push({
+        text: messageText,
+        sender: senderName,
+        type: type,
+        targets: targets || [threadName],
+        timestamp: Date.now(),
+      });
+      console.log(`[Bridge] Message queued for busy agent "${threadName}" (position ${queue.length})`);
+      return { status: 'queued', position: queue.length };
+    }
+
+    // IDLE — deliver immediately (existing interjection behavior)
+    const formatted = this.formatMessage(messageText, senderName, { type, targets });
+    this.sendMessage(threadName, formatted, win);
+    return { status: 'delivered' };
+  }
+
+  /**
+   * Drain queued messages for a thread after its subprocess exits.
+   * Multiple messages are batched into a single delivery.
+   */
+  drainQueue(threadName, win) {
+    const queue = this.messageQueues.get(threadName);
+    if (!queue || queue.length === 0) return;
+
+    // Clear queue before sending (prevents re-entrance)
+    this.messageQueues.delete(threadName);
+
+    console.log(`[Bridge] Draining ${queue.length} queued message(s) for "${threadName}"`);
+
+    if (queue.length === 1) {
+      // Single message — deliver normally
+      const msg = queue[0];
+      const formatted = this.formatMessage(msg.text, msg.sender, {
+        type: msg.type,
+        targets: msg.targets,
+      });
+      this.sendMessage(threadName, formatted, win);
+      return;
+    }
+
+    // Multiple messages — batch format
+    const lines = [`[While you were busy, ${queue.length} messages arrived]\n`];
+    for (const msg of queue) {
+      const time = new Date(msg.timestamp).toLocaleTimeString();
+      lines.push(`[From agent "${msg.sender}"] (${time}):`);
+      lines.push(msg.text);
+      lines.push('');
+    }
+    lines.push('(Review the above messages. Reply only if actionable work is needed.');
+    lines.push('Use send_to_agent("name", response) to respond to a specific agent.)');
+
+    this.sendMessage(threadName, lines.join('\n'), win);
+  }
+
+  /**
+   * Returns list of active agent threads with their status and queue depth.
    */
   getActiveAgents() {
     const agents = [];
     for (const [threadName] of this.threads) {
+      const queue = this.messageQueues.get(threadName) || [];
       agents.push({
         name: threadName,
         status: this.activeProcesses.has(threadName) ? 'streaming' : 'idle',
+        queueDepth: queue.length,
       });
     }
     return agents;

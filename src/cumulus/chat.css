@@ -282,6 +282,28 @@
   opacity: 0.6;
 }
 
+.message-bubble__agent-header {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4em;
+  margin-bottom: 0.2em;
+}
+
+.message-bubble__agent-header .message-bubble__agent-tag {
+  margin-bottom: 0;
+}
+
+.message-bubble__agent-context {
+  font-size: 0.72em;
+  font-family: 'SF Mono', 'Fira Code', Consolas, monospace;
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.message-bubble--agent-cc .message-bubble__content {
+  border-left-style: dashed;
+  opacity: 0.7;
+}
+
 /* Timestamp */
 .message-bubble__timestamp {
   font-size: 0.8em;

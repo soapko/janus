@@ -39,13 +39,31 @@ function agentColor(name: string): string {
   return AGENT_COLORS[Math.abs(hash) % AGENT_COLORS.length];
 }
 
-/** Parse inter-agent message prefix: [From agent "name"]: and strip reply hint */
-function parseAgentMessage(content: string): { agentName: string; body: string } | null {
-  const match = content.match(/^\[From agent "([^"]+)"\]:\n([\s\S]+)$/);
-  if (!match) return null;
-  // Strip the reply hint line (parenthetical at the end starting with "Reply using send_to_agent")
-  const body = match[2].replace(/\n*\(Reply using send_to_agent\([\s\S]*$/, '').trim();
-  return { agentName: match[1], body };
+/** Parse inter-agent message prefix and strip reply hint */
+function parseAgentMessage(content: string): {
+  agentName: string;
+  targets: string;
+  type: 'direct' | 'cc' | 'broadcast';
+  body: string;
+} | null {
+  // New format: [sender → target(s)]:, [sender → target(s) (CC'd)]:, [sender → all]:
+  const newMatch = content.match(/^\[([^\]→]+?)\s*→\s*([^\]]+?)(?:\s*\(CC'd\))?\s*\]:\n([\s\S]+)$/);
+  if (newMatch) {
+    const sender = newMatch[1].trim();
+    const rawTarget = newMatch[2].trim();
+    const isCc = /\(CC'd\)\s*\]:/.test(content);
+    const isBroadcast = rawTarget === 'all';
+    const type = isBroadcast ? 'broadcast' : isCc ? 'cc' : 'direct';
+    const body = newMatch[3].replace(/\n*\((Reply using send_to_agent|You are CC'd|Reply using)[\s\S]*$/, '').trim();
+    return { agentName: sender, targets: rawTarget, type, body };
+  }
+  // Legacy format: [From agent "X"]:
+  const legacyMatch = content.match(/^\[From agent "([^"]+)"\]:\n([\s\S]+)$/);
+  if (legacyMatch) {
+    const body = legacyMatch[2].replace(/\n*\(Reply using send_to_agent\([\s\S]*$/, '').trim();
+    return { agentName: legacyMatch[1], targets: '', type: 'direct', body };
+  }
+  return null;
 }
 
 function getExtension(name: string): string {
@@ -193,9 +211,15 @@ export default function MessageBubble({ message }: MessageBubbleProps): React.Re
 
   if (agentInfo) {
     const color = agentColor(agentInfo.agentName);
+    const typeLabel = agentInfo.type === 'cc' ? 'CC\u2019d'
+      : agentInfo.type === 'broadcast' ? 'broadcast'
+      : agentInfo.targets || null;
     return (
-      <div className="message-bubble message-bubble--agent" style={{ '--agent-color': color } as React.CSSProperties}>
-        <div className="message-bubble__agent-tag">{agentInfo.agentName}</div>
+      <div className={`message-bubble message-bubble--agent${agentInfo.type === 'cc' ? ' message-bubble--agent-cc' : ''}`} style={{ '--agent-color': color } as React.CSSProperties}>
+        <div className="message-bubble__agent-header">
+          <span className="message-bubble__agent-tag">{agentInfo.agentName}</span>
+          {typeLabel && <span className="message-bubble__agent-context">→ {typeLabel}</span>}
+        </div>
         <div className="message-bubble__content">
           <MarkdownRenderer content={agentInfo.body} />
         </div>

@@ -63,6 +63,13 @@
   - Agent message visual styling (colored borders, badges)
   - Multi-project support, agent spawning
 
+## 021 - Agent Messaging Reliability
+
+- [◒] 021: Load-based message throttling -> [021-load-based-message-throttling.md](docs/tasks/021-load-based-message-throttling.md)
+  - Queue messages to busy (streaming) agents instead of killing subprocess
+  - Batch-deliver queued messages when agent finishes current turn
+  - Expose queue depth in `list_agents`, delivery status in `send_to_agent`
+
 ## 019 - UX Polish
 
 - [◒] 019: New tab default thread -> [019-new-tab-default-thread.md](docs/tasks/019-new-tab-default-thread.md)

@@ -12,6 +12,7 @@
  * Tools:
  *   list_agents   - List all active agents
  *   send_to_agent - Send a message to another agent
+ *   broadcast     - Send a message to all active agents
  */
 
 const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
@@ -71,7 +72,7 @@ async function main() {
       {
         name: 'list_agents',
         description:
-          'List all active Janus agents (cumulus chat tabs). Returns each agent\'s name and status (idle or streaming). Use this to discover which agents are available to communicate with.',
+          'List all active Janus agents (cumulus chat tabs). Returns each agent\'s name and status (idle or streaming), and queueDepth (number of messages waiting for delivery). Use this to discover which agents are available to communicate with.',
         inputSchema: {
           type: 'object',
           properties: {},
@@ -81,20 +82,40 @@ async function main() {
       {
         name: 'send_to_agent',
         description:
-          'Send a message to another Janus agent by name. The message is delivered as an interjection — the target agent\'s current work is interrupted and it sees your message as a new user turn. Returns immediately (non-blocking). The target agent will process your message independently. If the target agent doesn\'t have an open tab, one will be created automatically.',
+          'Send a message to another Janus agent by name. The message is delivered as an interjection — the target agent\'s current work is interrupted and it sees your message as a new user turn. Returns immediately (non-blocking). The target agent will process your message independently. If the target agent doesn\'t have an open tab, one will be created automatically. Messages are private — only the named target(s) receive them. Use the broadcast tool to send to all agents. If the target is busy (streaming), the message is queued and will be delivered when they finish their current turn. Queued messages are batched — the target sees all pending messages at once. The response includes status ("delivered" or "queued") and position in queue if queued.',
         inputSchema: {
           type: 'object',
           properties: {
             target: {
-              type: 'string',
-              description: 'The name of the target agent (its thread name)',
+              description:
+                'The name of the target agent (its thread name), or an array of agent names for multi-target messaging (e.g., ["puppet", "abra"]). Only the named targets receive the message.',
+              oneOf: [
+                { type: 'string' },
+                { type: 'array', items: { type: 'string' } },
+              ],
             },
             message: {
               type: 'string',
-              description: 'The message to send. Can include code, diffs, file paths, or any rich text.',
+              description:
+                'The message to send. Can include code, diffs, file paths, or any rich text.',
             },
           },
           required: ['target', 'message'],
+        },
+      },
+      {
+        name: 'broadcast',
+        description:
+          'Send a message to ALL active Janus agents simultaneously. The message is delivered to every agent except yourself. Returns a summary of delivery results per agent. Use this when you need to announce something to all agents (e.g., "I changed the API for X", "build is broken, hold off on commits"). Busy agents will have their messages queued for batch delivery when they finish.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            message: {
+              type: 'string',
+              description: 'The message to broadcast to all agents.',
+            },
+          },
+          required: ['message'],
         },
       },
       {
@@ -149,38 +170,61 @@ async function main() {
         };
       }
 
-      if (target === AGENT_NAME) {
+      // Normalize target to array
+      const targets = Array.isArray(target) ? target : [target];
+
+      // Filter out self
+      const filtered = targets.filter(t => t !== AGENT_NAME);
+      if (filtered.length === 0) {
         return {
           content: [{ type: 'text', text: JSON.stringify({ delivered: false, error: 'Cannot send message to self' }) }],
           isError: true,
         };
       }
 
-      // Try to send the message
-      let result = await apiRequest('POST', `/api/agents/${encodeURIComponent(target)}/message`, {
+      // Auto-create tabs for any targets that don't exist yet
+      for (const t of filtered) {
+        const check = await apiRequest('GET', '/api/agents');
+        const exists = (check.agents || []).some(a => a.name === t);
+        if (!exists) {
+          const createResult = await apiRequest('POST', '/api/agents', { threadName: t });
+          if (createResult.error) {
+            return {
+              content: [{ type: 'text', text: JSON.stringify({ delivered: false, error: `Failed to auto-create agent tab "${t}": ${createResult.error}` }) }],
+              isError: true,
+            };
+          }
+          // Wait for tab to initialize
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+      }
+
+      // Use multi-target endpoint (private by default)
+      const result = await apiRequest('POST', '/api/agents/message', {
+        targets: filtered,
         message,
         sender: AGENT_NAME,
       });
 
-      // If agent not found, auto-open a chat tab for it and retry
-      if (result.error && result.error.includes('not found')) {
-        const createResult = await apiRequest('POST', '/api/agents', { threadName: target });
-        if (createResult.error) {
-          return {
-            content: [{ type: 'text', text: JSON.stringify({ delivered: false, error: `Failed to auto-create agent tab: ${createResult.error}` }) }],
-            isError: true,
-          };
-        }
+      return {
+        content: [{ type: 'text', text: JSON.stringify(result) }],
+        isError: !!result.error,
+      };
+    }
 
-        // Wait briefly for the tab to initialize (React mount + thread creation)
-        await new Promise(resolve => setTimeout(resolve, 2000));
-
-        // Retry the message
-        result = await apiRequest('POST', `/api/agents/${encodeURIComponent(target)}/message`, {
-          message,
-          sender: AGENT_NAME,
-        });
+    if (name === 'broadcast') {
+      const { message } = args;
+      if (!message) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ delivered: false, error: 'Missing message' }) }],
+          isError: true,
+        };
       }
+
+      const result = await apiRequest('POST', '/api/agents/broadcast', {
+        message,
+        sender: AGENT_NAME,
+      });
 
       return {
         content: [{ type: 'text', text: JSON.stringify(result) }],

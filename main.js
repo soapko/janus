@@ -518,11 +518,86 @@ function startHttpApi() {
       return;
     }
 
-    // POST /api/agents/:name/message — deliver message to a specific agent
+    // POST /api/agents/message — deliver message to one or more target agents
+    // Body: { targets: ["a", "b"], message, sender, broadcast?: boolean }
+    if (req.method === 'POST' && segments[0] === 'api' && segments[1] === 'agents' && segments[2] === 'message' && !segments[3]) {
+      const body = await readBody(req);
+      const { targets, message, sender, broadcast: isBroadcast } = body;
+
+      if (!targets || !Array.isArray(targets) || targets.length === 0 || !message || !sender) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ delivered: false, error: 'Missing targets (array), message, or sender' }));
+        return;
+      }
+
+      // Resolve bridges for all targets
+      const resolved = []; // [{ name, bridge, win }]
+      const notFound = [];
+      for (const targetName of targets) {
+        let found = false;
+        for (const [winId, bridge] of windowBridges) {
+          if (bridge.threads.has(targetName)) {
+            const win = BrowserWindow.fromId(winId);
+            if (win) resolved.push({ name: targetName, bridge, win });
+            found = true;
+            break;
+          }
+        }
+        if (!found) notFound.push(targetName);
+      }
+
+      if (resolved.length === 0) {
+        const available = [];
+        for (const [, bridge] of windowBridges) {
+          for (const [name] of bridge.threads) available.push(name);
+        }
+        res.writeHead(404);
+        res.end(JSON.stringify({ delivered: false, error: `No targets found: ${notFound.join(', ')}`, available }));
+        return;
+      }
+
+      const targetNames = resolved.map(r => r.name);
+
+      // Inject to each direct target (collect delivery status)
+      const deliveryResults = [];
+      for (const { name, bridge, win } of resolved) {
+        try {
+          const result = await bridge.injectMessage(name, message, sender, win, { type: 'direct', targets: targetNames });
+          deliveryResults.push({ target: name, ...result });
+        } catch (err) {
+          console.error(`[Agent API] injectMessage error for ${name}:`, err);
+          deliveryResults.push({ target: name, status: 'error', error: err.message });
+        }
+        win.webContents.send('janus:tab-unread', { threadName: name });
+      }
+
+      // CC all other agents only if broadcast flag is set (private by default)
+      const ccResults = [];
+      if (isBroadcast) {
+        for (const [winId, bridge] of windowBridges) {
+          for (const [name] of bridge.threads) {
+            if (targetNames.includes(name) || name === sender) continue;
+            const win = BrowserWindow.fromId(winId);
+            if (!win) continue;
+            bridge.injectMessage(name, message, sender, win, { type: 'cc', targets: targetNames }).catch(err => {
+              console.error(`[Agent API] CC injectMessage error for ${name}:`, err);
+            });
+            win.webContents.send('janus:tab-unread', { threadName: name });
+            ccResults.push(name);
+          }
+        }
+      }
+
+      res.writeHead(200);
+      res.end(JSON.stringify({ delivered: true, targets: targetNames, notFound, cc: ccResults, results: deliveryResults }));
+      return;
+    }
+
+    // POST /api/agents/:name/message — deliver message to a single agent (legacy/convenience)
     if (req.method === 'POST' && segments[0] === 'api' && segments[1] === 'agents' && segments[3] === 'message') {
       const targetName = decodeURIComponent(segments[2]);
       const body = await readBody(req);
-      const { message, sender } = body;
+      const { message, sender, broadcast: isBroadcast } = body;
 
       if (!message || !sender) {
         res.writeHead(400);
@@ -542,28 +617,77 @@ function startHttpApi() {
       }
 
       if (!targetBridge || !targetWin) {
-        // Collect available agent names for helpful error
         const available = [];
         for (const [, bridge] of windowBridges) {
-          for (const [name] of bridge.threads) {
-            available.push(name);
-          }
+          for (const [name] of bridge.threads) available.push(name);
         }
         res.writeHead(404);
         res.end(JSON.stringify({ delivered: false, error: `Agent "${targetName}" not found`, available }));
         return;
       }
 
-      // Inject the message (non-blocking from the sender's perspective)
-      targetBridge.injectMessage(targetName, message, sender, targetWin).catch(err => {
+      // Inject to the primary target
+      let deliveryResult;
+      try {
+        deliveryResult = await targetBridge.injectMessage(targetName, message, sender, targetWin, { type: 'direct', targets: [targetName] });
+      } catch (err) {
         console.error(`[Agent API] injectMessage error for ${targetName}:`, err);
-      });
-
-      // Notify renderer to show unread badge on target tab
+        deliveryResult = { status: 'error', error: err.message };
+      }
       targetWin.webContents.send('janus:tab-unread', { threadName: targetName });
 
+      // CC all other agents only if broadcast flag is set (private by default)
+      const ccResults = [];
+      if (isBroadcast) {
+        for (const [winId, bridge] of windowBridges) {
+          for (const [name] of bridge.threads) {
+            if (name === targetName || name === sender) continue;
+            const win = BrowserWindow.fromId(winId);
+            if (!win) continue;
+            bridge.injectMessage(name, message, sender, win, { type: 'cc', targets: [targetName] }).catch(err => {
+              console.error(`[Agent API] CC injectMessage error for ${name}:`, err);
+            });
+            win.webContents.send('janus:tab-unread', { threadName: name });
+            ccResults.push(name);
+          }
+        }
+      }
+
       res.writeHead(200);
-      res.end(JSON.stringify({ delivered: true, target: targetName }));
+      res.end(JSON.stringify({ delivered: true, target: targetName, cc: ccResults, ...deliveryResult }));
+      return;
+    }
+
+    // POST /api/agents/broadcast — deliver message to all agents
+    if (req.method === 'POST' && segments[0] === 'api' && segments[1] === 'agents' && segments[2] === 'broadcast' && !segments[3]) {
+      const body = await readBody(req);
+      const { message, sender } = body;
+
+      if (!message || !sender) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ delivered: false, error: 'Missing message or sender' }));
+        return;
+      }
+
+      const results = [];
+      for (const [winId, bridge] of windowBridges) {
+        for (const [name] of bridge.threads) {
+          if (name === sender) continue;
+          const win = BrowserWindow.fromId(winId);
+          if (!win) continue;
+          try {
+            const result = await bridge.injectMessage(name, message, sender, win, { type: 'broadcast' });
+            results.push({ target: name, ...result });
+          } catch (err) {
+            console.error(`[Agent API] broadcast injectMessage error for ${name}:`, err);
+            results.push({ target: name, status: 'error', error: err.message });
+          }
+          win.webContents.send('janus:tab-unread', { threadName: name });
+        }
+      }
+
+      res.writeHead(200);
+      res.end(JSON.stringify({ delivered: true, recipients: results }));
       return;
     }
 
