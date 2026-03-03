@@ -70,6 +70,14 @@
   - Batch-deliver queued messages when agent finishes current turn
   - Expose queue depth in `list_agents`, delivery status in `send_to_agent`
 
+## 022 - System Performance
+
+- [◒] 022: System-level performance throttling -> [022-system-performance-throttling.md](docs/tasks/022-system-performance-throttling.md)
+  - SystemHealthMonitor polls CPU load + memory, computes degradation score
+  - SubprocessPool gates all Claude spawns with adaptive concurrency (6/3/2)
+  - Hysteresis prevents level flapping, FIFO queue for spawn requests
+  - `GET /api/system/health` endpoint for monitoring
+
 ## 019 - UX Polish
 
 - [◒] 019: New tab default thread -> [019-new-tab-default-thread.md](docs/tasks/019-new-tab-default-thread.md)

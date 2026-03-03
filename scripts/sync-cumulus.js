@@ -25,7 +25,9 @@ if (!skipBuild) {
 
 // Pack cumulus into a tarball (stays in cumulus dir so package.json ref is stable)
 console.log('[sync-cumulus] Packing cumulus...');
-const tarball = execSync('npm pack', { cwd: cumulusDir, encoding: 'utf8' }).trim();
+const packOutput = execSync('npm pack', { cwd: cumulusDir, encoding: 'utf8' }).trim();
+// npm pack may output prepare script noise before the tarball name — take last line only
+const tarball = packOutput.split('\n').pop().trim();
 const tarballPath = path.join(cumulusDir, tarball);
 
 // Install the tarball (npm copies files properly, no symlink)

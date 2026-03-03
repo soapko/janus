@@ -115,10 +115,19 @@ function resolveNode() {
 
 // Lazy-loaded Cumulus modules (ESM)
 let cumulus = null;
+let resolvedProxyPath = null;
+let resolvedMcpServerPath = null;
 
 async function loadCumulus() {
   if (cumulus) return cumulus;
   cumulus = await import('cumulus');
+  // Cache resolved paths for generateMcpConfig (sync function needs these)
+  try {
+    resolvedProxyPath = cumulus.getProxyPath();
+    resolvedMcpServerPath = cumulus.getMcpServerPath();
+  } catch {
+    // Fallback to hardcoded paths in generateMcpConfig
+  }
   return cumulus;
 }
 
@@ -185,26 +194,44 @@ function generateSystemPrompt(count, tokens, sessionId, recentMessages, retrieve
     .replace('{retrievedContext}', retrievedContext);
 }
 
-function generateMcpConfig(threadPath, sessionId, agentName) {
-  // Point to the cumulus MCP server in node_modules
-  const mcpServerPath = path.resolve(__dirname, 'node_modules/cumulus/dist/mcp/index.js');
+function generateMcpConfig(threadPath, sessionId, agentName, sharedMcpPort = null) {
   const agentsMcpPath = path.resolve(__dirname, 'janus-agents-mcp.js');
-  const contentStorePath = getContentStorePath(threadPath);
-  const sessionsPath = getSessionsPath(threadPath);
   const nodePath = resolveNode();
+
+  // Cumulus-history MCP: use lightweight proxy if shared server is running, else full server
+  let cumulusHistoryConfig;
+  if (sharedMcpPort) {
+    // Shared mode: tiny proxy (~5MB) that forwards JSON-RPC to shared HTTP server
+    const proxyPath = resolvedProxyPath || path.resolve(__dirname, 'node_modules/cumulus/dist/mcp/proxy.js');
+    const threadName = path.basename(threadPath, '.jsonl');
+    cumulusHistoryConfig = {
+      command: nodePath,
+      args: [proxyPath],
+      env: {
+        CUMULUS_SHARED_URL: `http://127.0.0.1:${sharedMcpPort}`,
+        CUMULUS_THREAD_NAME: threadName,
+      },
+    };
+  } else {
+    // Fallback: full MCP server per agent (~50MB each)
+    const mcpServerPath = resolvedMcpServerPath || path.resolve(__dirname, 'node_modules/cumulus/dist/mcp/index.js');
+    const contentStorePath = getContentStorePath(threadPath);
+    const sessionsPath = getSessionsPath(threadPath);
+    cumulusHistoryConfig = {
+      command: nodePath,
+      args: [mcpServerPath],
+      env: {
+        CUMULUS_THREAD_PATH: threadPath,
+        CUMULUS_CONTENT_PATH: contentStorePath,
+        CUMULUS_SESSIONS_PATH: sessionsPath,
+        ...(sessionId && { CUMULUS_SESSION_ID: sessionId }),
+      },
+    };
+  }
 
   const config = {
     mcpServers: {
-      'cumulus-history': {
-        command: nodePath,
-        args: [mcpServerPath],
-        env: {
-          CUMULUS_THREAD_PATH: threadPath,
-          CUMULUS_CONTENT_PATH: contentStorePath,
-          CUMULUS_SESSIONS_PATH: sessionsPath,
-          ...(sessionId && { CUMULUS_SESSION_ID: sessionId }),
-        },
-      },
+      'cumulus-history': cumulusHistoryConfig,
       'janus-agents': {
         command: nodePath,
         args: [agentsMcpPath],
@@ -343,9 +370,12 @@ function mapMessageForRenderer(msg) {
 }
 
 class CumulusBridge {
-  constructor(projectPath, windowId = null) {
+  constructor(projectPath, windowId = null, pool = null, sharedMcpPort = null) {
     this.projectPath = projectPath;
     this.windowId = windowId;
+    this.pool = pool;            // SubprocessPool (shared across bridges)
+    this.sharedMcpPort = sharedMcpPort; // Shared cumulus-history MCP server port (null = use per-agent full server)
+    this._destroyed = false;     // Safety flag for queued-then-destroyed
     this.threads = new Map(); // threadName -> { history, content, session, mcpConfigPath }
     this.activeProcesses = new Map(); // threadName -> ChildProcess
     this.messageQueues = new Map(); // threadName -> QueuedMessage[]
@@ -371,7 +401,7 @@ class CumulusBridge {
     const session = new lib.SessionManager(sessionsPath, threadName);
     await session.initialize();
 
-    const mcpConfigPath = generateMcpConfig(threadPath, session.getSessionId(), threadName);
+    const mcpConfigPath = generateMcpConfig(threadPath, session.getSessionId(), threadName, this.sharedMcpPort);
 
     const thread = { history, content, session, mcpConfigPath, threadPath };
     this.threads.set(threadName, thread);
@@ -410,6 +440,15 @@ class CumulusBridge {
   }
 
   async sendMessage(threadName, messageText, win, attachments = []) {
+    // Gate through subprocess pool (Layer 2 throttling)
+    if (this.pool) {
+      await this.pool.acquire(threadName);
+      if (this._destroyed) {
+        this.pool.release(threadName);
+        return null;
+      }
+    }
+
     const lib = await loadCumulus();
     const thread = await this.getOrCreateThread(threadName);
 
@@ -678,6 +717,11 @@ FILE READING: The built-in Read tool is DISABLED. Use read_file for ALL file rea
         completed = true;
         this.activeProcesses.delete(threadName);
 
+        // Release subprocess pool slot
+        if (this.pool) {
+          this.pool.release(threadName);
+        }
+
         console.log('[Bridge] handleCompletion: fullResponse length =', fullResponse.length);
 
         try {
@@ -748,6 +792,12 @@ FILE READING: The built-in Read tool is DISABLED. Use read_file for ALL file rea
 
       claude.on('error', (err) => {
         this.activeProcesses.delete(threadName);
+
+        // Release subprocess pool slot on error
+        if (this.pool) {
+          this.pool.release(threadName);
+        }
+
         const errorMsg = err.message.includes('ENOENT')
           ? 'Claude CLI not found. Please install it first.'
           : err.message;
@@ -953,6 +1003,8 @@ FILE READING: The built-in Read tool is DISABLED. Use read_file for ALL file rea
   }
 
   destroy() {
+    this._destroyed = true;
+
     // Kill all running processes
     for (const [threadName, proc] of this.activeProcesses) {
       proc.kill('SIGTERM');

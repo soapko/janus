@@ -6,6 +6,8 @@ const http = require('http');
 const pty = require('node-pty');
 const { COLOR_PALETTE, getProjectColor, getProjectColorId, setProjectColor, getColorHex } = require('./projectColors');
 const { CumulusBridge } = require('./cumulus-bridge');
+const { SystemHealthMonitor } = require('./system-health');
+const { SubprocessPool } = require('./subprocess-pool');
 
 const windows = new Set();
 // Map PTY processes by window ID and terminal ID: windowId -> Map(terminalId -> ptyProcess)
@@ -15,6 +17,12 @@ const windowBridges = new Map();
 // Map window ID -> active cumulus thread name (reported by renderer)
 const windowActiveCumulusTab = new Map();
 let nextTerminalId = 1;
+
+// Performance throttling globals
+let healthMonitor = null;
+let subprocessPool = null;
+// Shared MCP server (cumulus-history) — one server for all agents
+let sharedMcpServer = null;
 
 function updateWindowTitle(win) {
   if (win.projectPath) {
@@ -52,8 +60,9 @@ function createWindow(projectPath = null) {
   // Initialize PTY map for this window
   windowPtyProcesses.set(win.id, new Map());
 
-  // Initialize Cumulus bridge for this window
-  const bridge = new CumulusBridge(projectPath, win.id);
+  // Initialize Cumulus bridge for this window (inject shared subprocess pool + shared MCP port)
+  const sharedMcpPort = sharedMcpServer ? sharedMcpServer.port : null;
+  const bridge = new CumulusBridge(projectPath, win.id, subprocessPool, sharedMcpPort);
   bridge.initialize().catch(err => console.error('[Cumulus] Init error:', err));
   windowBridges.set(win.id, bridge);
 
@@ -670,11 +679,17 @@ function startHttpApi() {
       }
 
       const results = [];
+      const BROADCAST_STAGGER_MS = 500; // Stagger spawns to prevent CPU spikes
+      let deliveryIndex = 0;
       for (const [winId, bridge] of windowBridges) {
         for (const [name] of bridge.threads) {
           if (name === sender) continue;
           const win = BrowserWindow.fromId(winId);
           if (!win) continue;
+          // Stagger delivery to idle agents (queued agents return instantly)
+          if (deliveryIndex > 0) {
+            await new Promise(r => setTimeout(r, BROADCAST_STAGGER_MS));
+          }
           try {
             const result = await bridge.injectMessage(name, message, sender, win, { type: 'broadcast' });
             results.push({ target: name, ...result });
@@ -683,6 +698,7 @@ function startHttpApi() {
             results.push({ target: name, status: 'error', error: err.message });
           }
           win.webContents.send('janus:tab-unread', { threadName: name });
+          deliveryIndex++;
         }
       }
 
@@ -703,6 +719,15 @@ function startHttpApi() {
         res.writeHead(500);
         res.end(JSON.stringify({ error: 'CDP not available' }));
       }
+      return;
+    }
+
+    // GET /api/system/health — system health and pool status
+    if (req.method === 'GET' && segments[0] === 'api' && segments[1] === 'system' && segments[2] === 'health') {
+      const health = healthMonitor ? healthMonitor.getStatus() : { error: 'not initialized' };
+      const pool = subprocessPool ? subprocessPool.getStatus() : { error: 'not initialized' };
+      res.writeHead(200);
+      res.end(JSON.stringify({ health, pool }));
       return;
     }
 
@@ -982,7 +1007,7 @@ app.commandLine.appendSwitch('disable-gpu-sandbox');
 app.commandLine.appendSwitch('enable-features', 'SharedArrayBuffer');
 app.commandLine.appendSwitch('disable-features', 'AudioServiceOutOfProcess');
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   // Configure permissions for webview partition
   const ses = session.fromPartition('persist:browser');
 
@@ -1024,6 +1049,29 @@ app.whenReady().then(() => {
     }
   });
 
+  // Initialize performance throttling
+  healthMonitor = new SystemHealthMonitor({ pollIntervalMs: 3000 });
+  subprocessPool = new SubprocessPool({
+    baseConcurrency: 6,
+    minConcurrency: 2,
+  });
+
+  healthMonitor.on('level-change', ({ from, to, score }) => {
+    console.log(`[Health] ${from} -> ${to} (score: ${score})`);
+    subprocessPool.setHealthLevel(to);
+  });
+
+  healthMonitor.start();
+
+  // Start shared cumulus-history MCP server (one server for all agents)
+  try {
+    const { startSharedMcpServer } = await import('cumulus');
+    sharedMcpServer = await startSharedMcpServer({ basePath: path.join(os.homedir(), '.cumulus'), port: 0 });
+    console.log(`[SharedMCP] cumulus-history server listening on port ${sharedMcpServer.port}`);
+  } catch (err) {
+    console.error('[SharedMCP] Failed to start shared MCP server, falling back to per-agent MCP:', err.message);
+  }
+
   createMenu();
   setupMenuRefresh();
   createWindow();
@@ -1033,6 +1081,22 @@ app.whenReady().then(() => {
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     app.quit();
+  }
+});
+
+app.on('will-quit', async () => {
+  // Shut down shared MCP server
+  if (sharedMcpServer) {
+    try {
+      await sharedMcpServer.close();
+      console.log('[SharedMCP] Shared MCP server closed');
+    } catch (err) {
+      console.error('[SharedMCP] Error closing shared MCP server:', err.message);
+    }
+  }
+  // Stop health monitor
+  if (healthMonitor) {
+    healthMonitor.stop();
   }
 });
 
