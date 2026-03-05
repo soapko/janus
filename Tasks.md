@@ -78,6 +78,15 @@
   - Hysteresis prevents level flapping, FIFO queue for spawn requests
   - `GET /api/system/health` endpoint for monitoring
 
+## 023 - Shared MCP Server
+
+- [✅] 023: Shared cumulus-history MCP server
+  - Single shared HTTP server for all agents (instead of 1 full MCP per agent)
+  - Lightweight proxy.js (~5MB) per agent instead of full index.js (~50MB)
+  - Thread isolation verified (agents can't see each other's content)
+  - Orphaned process cleanup on app launch and quit
+  - Cumulus 0.5.1 integration
+
 ## 019 - UX Polish
 
 - [◒] 019: New tab default thread -> [019-new-tab-default-thread.md](docs/tasks/019-new-tab-default-thread.md)

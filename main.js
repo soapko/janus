@@ -1063,6 +1063,21 @@ app.whenReady().then(async () => {
 
   healthMonitor.start();
 
+  // Kill orphaned full MCP server processes from previous sessions
+  try {
+    const { execSync } = require('child_process');
+    const pids = execSync("pgrep -f 'cumulus/dist/mcp/index.js' || true", { encoding: 'utf8' }).trim();
+    if (pids) {
+      const pidList = pids.split('\n').filter(Boolean);
+      for (const pid of pidList) {
+        try { process.kill(parseInt(pid)); } catch (e) { /* already dead */ }
+      }
+      console.log(`[Cleanup] Killed ${pidList.length} orphaned MCP server processes`);
+    }
+  } catch (err) {
+    console.error('[Cleanup] Error sweeping orphaned MCP processes:', err.message);
+  }
+
   // Start shared cumulus-history MCP server (one server for all agents)
   try {
     const { startSharedMcpServer } = await import('cumulus');
@@ -1094,6 +1109,18 @@ app.on('will-quit', async () => {
       console.error('[SharedMCP] Error closing shared MCP server:', err.message);
     }
   }
+  // Sweep any stale full MCP server processes
+  try {
+    const { execSync } = require('child_process');
+    const pids = execSync("pgrep -f 'cumulus/dist/mcp/index.js' || true", { encoding: 'utf8' }).trim();
+    if (pids) {
+      const pidList = pids.split('\n').filter(Boolean);
+      for (const pid of pidList) {
+        try { process.kill(parseInt(pid)); } catch (e) { /* already dead */ }
+      }
+      console.log(`[Cleanup] Killed ${pidList.length} stale MCP processes on quit`);
+    }
+  } catch (err) { /* best effort */ }
   // Stop health monitor
   if (healthMonitor) {
     healthMonitor.stop();
