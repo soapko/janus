@@ -120,7 +120,7 @@ let resolvedMcpServerPath = null;
 
 async function loadCumulus() {
   if (cumulus) return cumulus;
-  cumulus = await import('cumulus');
+  cumulus = await import('@luckydraw/cumulus');
   // Cache resolved paths for generateMcpConfig (sync function needs these)
   try {
     resolvedProxyPath = cumulus.getProxyPath();
@@ -202,7 +202,7 @@ function generateMcpConfig(threadPath, sessionId, agentName, sharedMcpPort = nul
   let cumulusHistoryConfig;
   if (sharedMcpPort) {
     // Shared mode: tiny proxy (~5MB) that forwards JSON-RPC to shared HTTP server
-    const proxyPath = resolvedProxyPath || path.resolve(__dirname, 'node_modules/cumulus/dist/mcp/proxy.js');
+    const proxyPath = resolvedProxyPath || path.resolve(__dirname, 'node_modules/@luckydraw/cumulus/dist/mcp/proxy.js');
     const threadName = path.basename(threadPath, '.jsonl');
     cumulusHistoryConfig = {
       command: nodePath,
@@ -214,7 +214,7 @@ function generateMcpConfig(threadPath, sessionId, agentName, sharedMcpPort = nul
     };
   } else {
     // Fallback: full MCP server per agent (~50MB each)
-    const mcpServerPath = resolvedMcpServerPath || path.resolve(__dirname, 'node_modules/cumulus/dist/mcp/index.js');
+    const mcpServerPath = resolvedMcpServerPath || path.resolve(__dirname, 'node_modules/@luckydraw/cumulus/dist/mcp/index.js');
     const contentStorePath = getContentStorePath(threadPath);
     const sessionsPath = getSessionsPath(threadPath);
     cumulusHistoryConfig = {

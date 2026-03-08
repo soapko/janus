@@ -1080,7 +1080,7 @@ app.whenReady().then(async () => {
 
   // Start shared cumulus-history MCP server (one server for all agents)
   try {
-    const { startSharedMcpServer } = await import('cumulus');
+    const { startSharedMcpServer } = await import('@luckydraw/cumulus');
     sharedMcpServer = await startSharedMcpServer({ basePath: path.join(os.homedir(), '.cumulus'), port: 0 });
     console.log(`[SharedMCP] cumulus-history server listening on port ${sharedMcpServer.port}`);
   } catch (err) {
