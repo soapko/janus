@@ -15,7 +15,6 @@ const THREADS_DIR = path.join(CUMULUS_DIR, 'threads');
 
 const RECENT_CONTEXT_COUNT = 10;
 const RECENT_MSG_MAX_TOKENS = 500;
-const TOTAL_CONTEXT_BUDGET = 120_000;
 const RECENT_CONTEXT_BUDGET = 6_000;
 
 const SYSTEM_PROMPT_TEMPLATE = `You have NO memory of this conversation. There are {count} prior messages (~{tokens} tokens) in the history.
@@ -369,6 +368,22 @@ function mapMessageForRenderer(msg) {
   };
 }
 
+/**
+ * Compute average relevance from the top-K retrieval scores.
+ * Takes the top 10 scores across history + content results to avoid dilution.
+ */
+function computeAvgRelevance(debug) {
+  if (!debug) return 0;
+  const allScores = [
+    ...(debug.historyResults || []).map(r => r.score),
+    ...(debug.contentResults || []).map(r => r.score),
+  ];
+  if (allScores.length === 0) return 0;
+  allScores.sort((a, b) => b - a);
+  const topK = allScores.slice(0, 10);
+  return topK.reduce((sum, s) => sum + s, 0) / topK.length;
+}
+
 class CumulusBridge {
   constructor(projectPath, windowId = null, pool = null, sharedMcpPort = null) {
     this.projectPath = projectPath;
@@ -379,6 +394,7 @@ class CumulusBridge {
     this.threads = new Map(); // threadName -> { history, content, session, mcpConfigPath }
     this.activeProcesses = new Map(); // threadName -> ChildProcess
     this.messageQueues = new Map(); // threadName -> QueuedMessage[]
+    this.debugContexts = new Map(); // threadName -> last debug context snapshot
   }
 
   async initialize() {
@@ -403,7 +419,10 @@ class CumulusBridge {
 
     const mcpConfigPath = generateMcpConfig(threadPath, session.getSessionId(), threadName, this.sharedMcpPort);
 
-    const thread = { history, content, session, mcpConfigPath, threadPath };
+    // Load adaptive context budget for this thread
+    const adaptive = await lib.loadAdaptiveState(threadPath);
+
+    const thread = { history, content, session, mcpConfigPath, threadPath, adaptive };
     this.threads.set(threadName, thread);
     return thread;
   }
@@ -550,11 +569,16 @@ class CumulusBridge {
     const mergedConfig = lib.mergeConfigs(globalConfig, threadConfig);
     const alwaysInclude = await lib.readAlwaysIncludeFiles(mergedConfig, threadCwd);
 
-    // Calculate RAG budget
+    // Calculate RAG budget using adaptive limit, with optional preset override
+    const adaptiveBudget = thread.adaptive.getTotalContextBudget();
     const userQueryTokens = lib.estimateTokens(messageText);
+    const overhead = userQueryTokens + alwaysInclude.totalTokens + RECENT_CONTEXT_BUDGET;
+    const effectiveBudget = lib.resolveRagBudget
+      ? lib.resolveRagBudget(mergedConfig, adaptiveBudget, overhead)
+      : adaptiveBudget;
     const ragBudget = Math.max(
       0,
-      TOTAL_CONTEXT_BUDGET - userQueryTokens - alwaysInclude.totalTokens - RECENT_CONTEXT_BUDGET
+      effectiveBudget - userQueryTokens - alwaysInclude.totalTokens - RECENT_CONTEXT_BUDGET
     );
 
     // Run RAG retrieval
@@ -562,17 +586,56 @@ class CumulusBridge {
     try {
       const threadPath = getThreadPath(threadName);
       const sessionsPath = getSessionsPath(threadPath);
+      const allMessages = await thread.history.getAll();
+      const totalMessages = allMessages.length;
       retrievalResult = await lib.retrieve(messageText, thread.history, thread.content, {
         budgetTokens: ragBudget,
         currentSessionId: thread.session.getSessionId(),
         sessionsPath,
         recentMessages: recentConversation,
+        totalMessages,
       });
     } catch (err) {
       console.error('[CumulusBridge] Retrieval error:', err);
     }
 
     const retrievedContext = retrievalResult?.context ?? '';
+
+    // Capture debug context snapshot for the Context Inspector
+    this.debugContexts.set(threadName, {
+      timestamp: Date.now(),
+      threadName,
+      sessionId: thread.session.getSessionId(),
+      messageCount: stats.count,
+      tokenCount: stats.totalTokens,
+      userMessage: messageText,
+      budget: {
+        total: adaptiveBudget,
+        userQuery: userQueryTokens,
+        alwaysInclude: alwaysInclude.totalTokens,
+        recentContext: RECENT_CONTEXT_BUDGET,
+        ragAvailable: ragBudget,
+        ragUsed: retrievalResult?.tokensUsed ?? 0,
+      },
+      retrieval: retrievalResult ? {
+        historyCount: retrievalResult.historyCount ?? 0,
+        contentCount: retrievalResult.contentCount ?? 0,
+        tokensUsed: retrievalResult.tokensUsed ?? 0,
+        avgRelevance: computeAvgRelevance(retrievalResult.debug),
+        queryType: retrievalResult.debug?.queryType ?? 'unknown',
+      } : null,
+      alwaysInclude: {
+        files: alwaysInclude.files?.map(f => ({
+          path: f.path || f.resolvedPath,
+          tokens: f.tokens || 0,
+          truncated: !!f.truncated,
+          error: f.error || null,
+        })) || [],
+        totalTokens: alwaysInclude.totalTokens,
+      },
+      recentMessageCount: recentMessages.length,
+      systemPromptLength: 0, // updated after generateSystemPrompt
+    });
 
     // Generate system prompt
     const systemPrompt = generateSystemPrompt(
@@ -584,6 +647,26 @@ class CumulusBridge {
       alwaysInclude.formattedContext,
       lib.estimateTokens
     );
+
+    // Update debug context with system prompt token estimate + breakdown
+    const debugCtx = this.debugContexts.get(threadName);
+    if (debugCtx) {
+      const systemPromptTokens = lib.estimateTokens(systemPrompt);
+      const ragTokens = retrievalResult ? lib.estimateTokens(retrievedContext) : 0;
+      const recentContext = formatRecentContext(recentConversation, RECENT_CONTEXT_BUDGET, lib.estimateTokens);
+      const recentContextTokens = lib.estimateTokens(recentContext);
+      const alwaysIncludeTokens = alwaysInclude.totalTokens;
+      const instructionTokens = systemPromptTokens - ragTokens - alwaysIncludeTokens - recentContextTokens;
+
+      debugCtx.systemPromptLength = systemPromptTokens;
+      debugCtx.systemPromptBreakdown = {
+        instructionTokens,
+        alwaysIncludeTokens,
+        recentContextTokens,
+        ragTokens,
+        totalTokens: systemPromptTokens,
+      };
+    }
 
     // Create stream processor for content externalization
     const streamProcessor = new lib.StreamProcessor({
@@ -659,6 +742,10 @@ FILE READING: The built-in Read tool is DISABLED. Use read_file for ALL file rea
     const pendingLines = [];
     const collectedSegments = [];
 
+    // TTFT measurement: time from spawn to first text chunk
+    const spawnTime = Date.now();
+    let ttft = null;
+
     const processLine = async (line) => {
       if (!line.trim()) return;
 
@@ -672,6 +759,10 @@ FILE READING: The built-in Read tool is DISABLED. Use read_file for ALL file rea
       // Existing text-only flow (backward compat)
       const text = extractTextFromStreamLine(processed.line);
       if (text) {
+        // Capture TTFT on first text output
+        if (ttft === null) {
+          ttft = Date.now() - spawnTime;
+        }
         if (fullResponse && !fullResponse.endsWith('\n')) {
           fullResponse += '\n\n';
           win.webContents.send('cumulus:stream-chunk', { threadName, text: '\n\n' });
@@ -745,6 +836,20 @@ FILE READING: The built-in Read tool is DISABLED. Use read_file for ALL file rea
               }
             } catch (sessionErr) {
               console.error('[Bridge] session update failed (non-fatal):', sessionErr);
+            }
+
+            // Record adaptive turn metrics and persist
+            try {
+              const tokensUsed = lib.estimateTokens(fullResponse) + userQueryTokens;
+              thread.adaptive.recordTurn({
+                ttft: ttft ?? (Date.now() - spawnTime), // fallback if no text was streamed
+                tokensUsed,
+                relevanceScore: computeAvgRelevance(retrievalResult?.debug),
+              });
+              await thread.adaptive.save();
+              console.log(`[Bridge] Adaptive turn recorded: TTFT=${ttft}ms, tokens=${tokensUsed}, limit=${thread.adaptive.getContextLimit()}`);
+            } catch (adaptiveErr) {
+              console.error('[Bridge] adaptive budget update failed (non-fatal):', adaptiveErr);
             }
 
             console.log('[Bridge] handleCompletion: sending stream-end with message');
@@ -1000,6 +1105,26 @@ FILE READING: The built-in Read tool is DISABLED. Use read_file for ALL file rea
       });
     }
     return agents;
+  }
+
+  /**
+   * Returns the last debug context snapshot for a thread plus the adaptive budget state.
+   */
+  async getDebugState(threadName) {
+    const debugContext = this.debugContexts.get(threadName) || null;
+
+    // Load adaptive state from sidecar file
+    let adaptiveState = null;
+    try {
+      const lib = await loadCumulus();
+      const threadPath = getThreadPath(threadName);
+      const adaptive = await lib.loadAdaptiveState(threadPath);
+      adaptiveState = adaptive.getState();
+    } catch {
+      // No adaptive state yet for this thread — that's normal
+    }
+
+    return { debugContext, adaptiveState };
   }
 
   destroy() {

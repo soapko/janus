@@ -294,6 +294,73 @@ ipcMain.handle('cumulus:revert', async (event, threadName, messageId, restoreGit
   return bridge.revert(threadName, messageId, restoreGit);
 });
 
+// ===== CONTEXT INSPECTOR (DEBUG WINDOW) =====
+
+let debugWindow = null;
+
+function createDebugWindow(parentWindow) {
+  if (debugWindow && !debugWindow.isDestroyed()) {
+    debugWindow.focus();
+    return;
+  }
+
+  debugWindow = new BrowserWindow({
+    width: 700,
+    height: 800,
+    title: 'Context Inspector',
+    webPreferences: {
+      preload: path.join(__dirname, 'debug-preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+
+  debugWindow.loadFile('debug-window.html');
+
+  debugWindow.on('closed', () => {
+    debugWindow = null;
+  });
+}
+
+// Get debug state for a specific thread (searches all bridges)
+ipcMain.handle('cumulus:get-debug-state', async (event, threadName) => {
+  // Search all bridges for the one that owns this thread
+  for (const [, bridge] of windowBridges) {
+    if (bridge.threads.has(threadName) || bridge.debugContexts.has(threadName)) {
+      return bridge.getDebugState(threadName);
+    }
+  }
+  // Fallback: try any bridge (adaptive state can be loaded from filesystem)
+  const firstBridge = windowBridges.values().next().value;
+  if (firstBridge && threadName) {
+    return firstBridge.getDebugState(threadName);
+  }
+  return { debugContext: null, adaptiveState: null };
+});
+
+// Get the currently active cumulus thread (most recently set by any window's renderer)
+ipcMain.handle('cumulus:get-active-thread', (event) => {
+  // Check if the sender is the debug window — if so, look at all tracked windows
+  const win = BrowserWindow.fromWebContents(event.sender);
+  // Return first active thread found across all windows
+  for (const [, threadName] of windowActiveCumulusTab) {
+    if (threadName) return threadName;
+  }
+  return null;
+});
+
+// List all threads from filesystem (usable by debug window which has no bridge)
+ipcMain.handle('cumulus:list-threads-debug', async () => {
+  const threadsDir = path.join(os.homedir(), '.cumulus', 'threads');
+  try {
+    if (!fs.existsSync(threadsDir)) return [];
+    const files = fs.readdirSync(threadsDir).filter(f => f.endsWith('.jsonl'));
+    return files.map(f => f.replace(/\.jsonl$/, ''));
+  } catch {
+    return [];
+  }
+});
+
 // Track which cumulus tab is active in the renderer
 ipcMain.on('janus:active-cumulus-tab', (event, threadName) => {
   const win = BrowserWindow.fromWebContents(event.sender);
@@ -969,6 +1036,15 @@ function createMenu() {
         {
           label: 'Project Color',
           submenu: buildProjectColorSubmenu()
+        },
+        { type: 'separator' },
+        {
+          label: 'Context Inspector',
+          accelerator: 'CmdOrCtrl+Shift+D',
+          click: () => {
+            const win = BrowserWindow.getFocusedWindow();
+            createDebugWindow(win);
+          }
         },
         { type: 'separator' },
         ...(isMac ? [

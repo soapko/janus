@@ -1,0 +1,743 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Context Inspector</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #1a1a2e;
+      --bg2:       #16213e;
+      --bg3:       #0f3460;
+      --border:    #2a2a4a;
+      --text:      #e0e0f0;
+      --muted:     #7070a0;
+      --cyan:      #00d4ff;
+      --yellow:    #ffd700;
+      --blue:      #4a9eff;
+      --magenta:   #ff66cc;
+      --green:     #39ff14;
+      --white:     #ffffff;
+      --gray:      #8888aa;
+      --red:       #ff4466;
+      --bar-bg:    #252545;
+    }
+
+    body {
+      font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+      font-size: 12px;
+      background: var(--bg);
+      color: var(--text);
+      padding: 12px;
+      line-height: 1.5;
+      overflow-x: hidden;
+    }
+
+    h1 {
+      font-size: 14px;
+      color: var(--cyan);
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      margin-bottom: 12px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 8px;
+    }
+
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+
+    select {
+      background: var(--bg2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 4px 8px;
+      font-family: inherit;
+      font-size: 12px;
+      flex: 1;
+      min-width: 140px;
+    }
+
+    select:focus {
+      outline: 1px solid var(--cyan);
+    }
+
+    button {
+      background: var(--bg2);
+      color: var(--cyan);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 4px 10px;
+      font-family: inherit;
+      font-size: 12px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    button:hover {
+      background: var(--bg3);
+      border-color: var(--cyan);
+    }
+
+    .toggle-label {
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .toggle-label input[type="checkbox"] {
+      accent-color: var(--cyan);
+      cursor: pointer;
+    }
+
+    .timestamp {
+      color: var(--muted);
+      font-size: 11px;
+      margin-left: auto;
+    }
+
+    .section {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      margin-bottom: 10px;
+      overflow: hidden;
+    }
+
+    .section-header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      background: var(--bg3);
+      cursor: pointer;
+      user-select: none;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .section-header:hover {
+      background: #1a3a5e;
+    }
+
+    .section-title {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-weight: bold;
+    }
+
+    .section-chevron {
+      margin-left: auto;
+      color: var(--muted);
+      font-size: 10px;
+      transition: transform 0.15s;
+    }
+
+    .section-body {
+      padding: 8px 10px;
+    }
+
+    .section.collapsed .section-body {
+      display: none;
+    }
+
+    .section.collapsed .section-chevron {
+      transform: rotate(-90deg);
+    }
+
+    /* Color classes */
+    .c-cyan    { color: var(--cyan); }
+    .c-yellow  { color: var(--yellow); }
+    .c-blue    { color: var(--blue); }
+    .c-magenta { color: var(--magenta); }
+    .c-green   { color: var(--green); }
+    .c-white   { color: var(--white); }
+    .c-gray    { color: var(--gray); }
+    .c-red     { color: var(--red); }
+    .c-muted   { color: var(--muted); }
+
+    /* Key-value grid */
+    .kv-grid {
+      display: grid;
+      grid-template-columns: max-content 1fr;
+      gap: 2px 12px;
+    }
+
+    .kv-key {
+      color: var(--muted);
+      text-align: right;
+    }
+
+    .kv-val {
+      color: var(--text);
+    }
+
+    /* Token budget bar */
+    .budget-bar-wrap {
+      margin: 8px 0 4px;
+    }
+
+    .budget-bar-track {
+      height: 14px;
+      background: var(--bar-bg);
+      border-radius: 3px;
+      overflow: hidden;
+      display: flex;
+    }
+
+    .budget-bar-segment {
+      height: 100%;
+      min-width: 1px;
+      transition: width 0.3s;
+    }
+
+    .budget-bar-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px 12px;
+      margin-top: 6px;
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 11px;
+    }
+
+    .legend-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 2px;
+      flex-shrink: 0;
+    }
+
+    /* File list */
+    .file-list {
+      list-style: none;
+    }
+
+    .file-list li {
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+      padding: 2px 0;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .file-list li:last-child {
+      border-bottom: none;
+    }
+
+    .file-path {
+      color: var(--yellow);
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .file-tokens {
+      color: var(--muted);
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+
+    .badge {
+      font-size: 10px;
+      padding: 1px 4px;
+      border-radius: 2px;
+      flex-shrink: 0;
+    }
+
+    .badge-warn { background: #3a2a00; color: var(--yellow); }
+    .badge-err  { background: #3a0010; color: var(--red); }
+
+    /* Adaptive history table */
+    .hist-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 11px;
+    }
+
+    .hist-table th {
+      color: var(--muted);
+      text-align: left;
+      padding: 3px 6px;
+      border-bottom: 1px solid var(--border);
+      font-weight: normal;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      font-size: 10px;
+    }
+
+    .hist-table td {
+      padding: 3px 6px;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    .hist-table tr:last-child td {
+      border-bottom: none;
+    }
+
+    .hist-table tr:hover td {
+      background: #1f1f40;
+    }
+
+    /* Status area */
+    .status-bar {
+      color: var(--muted);
+      font-size: 11px;
+      padding: 4px 0;
+      text-align: center;
+      border-top: 1px solid var(--border);
+      margin-top: 10px;
+    }
+
+    .no-data {
+      color: var(--muted);
+      font-style: italic;
+      padding: 8px 0;
+    }
+
+    .user-msg {
+      color: var(--green);
+      background: #0a2010;
+      border: 1px solid #1a4020;
+      border-radius: 3px;
+      padding: 6px 8px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 80px;
+      overflow: auto;
+    }
+  </style>
+</head>
+<body>
+  <h1>Context Inspector</h1>
+
+  <div class="controls">
+    <select id="threadSelect">
+      <option value="">— select thread —</option>
+    </select>
+    <button id="refreshBtn">Refresh</button>
+    <label class="toggle-label">
+      <input type="checkbox" id="autoRefresh" checked />
+      Auto (2s)
+    </label>
+    <span class="timestamp" id="lastUpdated"></span>
+  </div>
+
+  <!-- Last Turn -->
+  <div class="section" id="sec-turn">
+    <div class="section-header" onclick="toggleSection('sec-turn')">
+      <span class="section-title c-green">Last Turn</span>
+      <span class="section-chevron">&#9660;</span>
+    </div>
+    <div class="section-body" id="body-turn">
+      <div class="no-data">No data yet.</div>
+    </div>
+  </div>
+
+  <!-- Adaptive Budget -->
+  <div class="section" id="sec-adaptive">
+    <div class="section-header" onclick="toggleSection('sec-adaptive')">
+      <span class="section-title c-cyan">Adaptive Budget State</span>
+      <span class="section-chevron">&#9660;</span>
+    </div>
+    <div class="section-body" id="body-adaptive">
+      <div class="no-data">No adaptive state found.</div>
+    </div>
+  </div>
+
+  <!-- Token Budget -->
+  <div class="section" id="sec-budget">
+    <div class="section-header" onclick="toggleSection('sec-budget')">
+      <span class="section-title c-white">Token Budget Breakdown</span>
+      <span class="section-chevron">&#9660;</span>
+    </div>
+    <div class="section-body" id="body-budget">
+      <div class="no-data">No data yet.</div>
+    </div>
+  </div>
+
+  <!-- Retrieval Stats -->
+  <div class="section" id="sec-retrieval">
+    <div class="section-header" onclick="toggleSection('sec-retrieval')">
+      <span class="section-title c-magenta">Retrieval Stats (RAG)</span>
+      <span class="section-chevron">&#9660;</span>
+    </div>
+    <div class="section-body" id="body-retrieval">
+      <div class="no-data">No retrieval data.</div>
+    </div>
+  </div>
+
+  <!-- Always-Include Files -->
+  <div class="section" id="sec-always">
+    <div class="section-header" onclick="toggleSection('sec-always')">
+      <span class="section-title c-yellow">Always-Include Files</span>
+      <span class="section-chevron">&#9660;</span>
+    </div>
+    <div class="section-body" id="body-always">
+      <div class="no-data">No always-include files.</div>
+    </div>
+  </div>
+
+  <!-- System Prompt -->
+  <div class="section" id="sec-sysprompt">
+    <div class="section-header" onclick="toggleSection('sec-sysprompt')">
+      <span class="section-title c-gray">System Prompt Breakdown</span>
+      <span class="section-chevron">&#9660;</span>
+    </div>
+    <div class="section-body" id="body-sysprompt">
+      <div class="no-data">No data yet.</div>
+    </div>
+  </div>
+
+  <!-- Adaptive History -->
+  <div class="section collapsed" id="sec-history">
+    <div class="section-header" onclick="toggleSection('sec-history')">
+      <span class="section-title c-blue">Adaptive History (last 20 turns)</span>
+      <span class="section-chevron">&#9660;</span>
+    </div>
+    <div class="section-body" id="body-history">
+      <div class="no-data">No history.</div>
+    </div>
+  </div>
+
+  <div class="status-bar" id="statusBar">Ready.</div>
+
+  <script>
+    let selectedThread = null;
+    let autoRefreshTimer = null;
+
+    // ── Section collapse/expand ──────────────────────────────────────────────
+    function toggleSection(id) {
+      const el = document.getElementById(id);
+      if (el) el.classList.toggle('collapsed');
+    }
+
+    // ── Utility ──────────────────────────────────────────────────────────────
+    function fmt(n) {
+      if (n == null) return '—';
+      return Number(n).toLocaleString();
+    }
+
+    function pct(part, total) {
+      if (!total) return '0%';
+      return Math.round((part / total) * 100) + '%';
+    }
+
+    function ago(ts) {
+      if (!ts) return '—';
+      const diff = Math.round((Date.now() - ts) / 1000);
+      if (diff < 60) return diff + 's ago';
+      if (diff < 3600) return Math.round(diff / 60) + 'm ago';
+      return Math.round(diff / 3600) + 'h ago';
+    }
+
+    function esc(str) {
+      if (str == null) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    function kv(label, value, colorClass) {
+      return `<span class="kv-key">${esc(label)}</span><span class="kv-val ${colorClass || ''}">${esc(String(value ?? '—'))}</span>`;
+    }
+
+    // ── Render functions ─────────────────────────────────────────────────────
+
+    function renderTurn(ctx) {
+      const el = document.getElementById('body-turn');
+      if (!ctx) { el.innerHTML = '<div class="no-data">No data yet.</div>'; return; }
+      const msgTrunc = ctx.userMessage
+        ? ctx.userMessage.slice(0, 300) + (ctx.userMessage.length > 300 ? '…' : '')
+        : '';
+      el.innerHTML = `
+        <div class="kv-grid" style="margin-bottom:8px">
+          ${kv('Thread', ctx.threadName, 'c-cyan')}
+          ${kv('Session', ctx.sessionId, 'c-muted')}
+          ${kv('Messages', fmt(ctx.messageCount), 'c-white')}
+          ${kv('Total stored tokens', fmt(ctx.tokenCount), 'c-white')}
+          ${kv('Recent msgs in context', fmt(ctx.recentMessageCount), 'c-blue')}
+          ${kv('Captured', ago(ctx.timestamp), 'c-muted')}
+        </div>
+        ${msgTrunc ? `<div class="user-msg">${esc(msgTrunc)}</div>` : ''}
+      `;
+    }
+
+    function renderAdaptive(state) {
+      const el = document.getElementById('body-adaptive');
+      if (!state) { el.innerHTML = '<div class="no-data">No adaptive state found.</div>'; return; }
+      el.innerHTML = `
+        <div class="kv-grid" style="margin-bottom:8px">
+          ${kv('Context limit', fmt(state.contextLimit) + ' tokens', 'c-cyan')}
+          ${kv('Last TTFT', state.lastTTFT != null ? state.lastTTFT + 'ms' : '—', 'c-white')}
+          ${kv('Last tokens used', fmt(state.lastTokensUsed), 'c-white')}
+          ${kv('Avg relevance score', state.avgRelevanceScore != null ? state.avgRelevanceScore.toFixed(3) : '—', 'c-green')}
+          ${kv('Turn count', fmt(state.turnCount), 'c-muted')}
+        </div>
+      `;
+    }
+
+    function renderBudget(ctx) {
+      const el = document.getElementById('body-budget');
+      if (!ctx || !ctx.budget) { el.innerHTML = '<div class="no-data">No data yet.</div>'; return; }
+      const b = ctx.budget;
+      const total = b.total || 1;
+
+      const segments = [
+        { label: 'User query',     value: b.userQuery,     color: '#39ff14' },
+        { label: 'Always-include', value: b.alwaysInclude, color: '#ffd700' },
+        { label: 'Recent context', value: b.recentContext,  color: '#4a9eff' },
+        { label: 'RAG used',       value: b.ragUsed,       color: '#ff66cc' },
+        { label: 'Free',           value: Math.max(0, total - b.userQuery - b.alwaysInclude - b.recentContext - b.ragUsed), color: '#252545' },
+      ];
+
+      const barSegs = segments.map(s => {
+        const w = Math.max(0, Math.min(100, (s.value / total) * 100));
+        return `<div class="budget-bar-segment" style="width:${w}%;background:${s.color}" title="${s.label}: ${fmt(s.value)} tokens (${pct(s.value, total)})"></div>`;
+      }).join('');
+
+      const legend = segments.map(s =>
+        `<span class="legend-item"><span class="legend-dot" style="background:${s.color}"></span><span class="c-muted">${esc(s.label)}</span> <span class="c-white">${fmt(s.value)}</span></span>`
+      ).join('');
+
+      el.innerHTML = `
+        <div class="kv-grid" style="margin-bottom:8px">
+          ${kv('Total budget',    fmt(b.total) + ' tokens', 'c-white')}
+          ${kv('User query',      fmt(b.userQuery) + ' tokens', 'c-green')}
+          ${kv('Always-include',  fmt(b.alwaysInclude) + ' tokens', 'c-yellow')}
+          ${kv('Recent context',  fmt(b.recentContext) + ' tokens', 'c-blue')}
+          ${kv('RAG available',   fmt(b.ragAvailable) + ' tokens', 'c-magenta')}
+          ${kv('RAG used',        fmt(b.ragUsed) + ' tokens', 'c-magenta')}
+        </div>
+        <div class="budget-bar-wrap">
+          <div class="budget-bar-track">${barSegs}</div>
+          <div class="budget-bar-legend">${legend}</div>
+        </div>
+      `;
+    }
+
+    function renderRetrieval(ctx) {
+      const el = document.getElementById('body-retrieval');
+      if (!ctx || !ctx.retrieval) { el.innerHTML = '<div class="no-data">No retrieval data.</div>'; return; }
+      const r = ctx.retrieval;
+      el.innerHTML = `
+        <div class="kv-grid">
+          ${kv('Query type',     r.queryType || 'unknown', 'c-cyan')}
+          ${kv('History chunks', fmt(r.historyCount), 'c-magenta')}
+          ${kv('Content chunks', fmt(r.contentCount), 'c-magenta')}
+          ${kv('Tokens used',    fmt(r.tokensUsed) + ' tokens', 'c-magenta')}
+        </div>
+      `;
+    }
+
+    function renderAlwaysInclude(ctx) {
+      const el = document.getElementById('body-always');
+      if (!ctx || !ctx.alwaysInclude) { el.innerHTML = '<div class="no-data">No always-include files.</div>'; return; }
+      const ai = ctx.alwaysInclude;
+      if (!ai.files || ai.files.length === 0) {
+        el.innerHTML = `<div class="kv-grid">${kv('Total tokens', fmt(ai.totalTokens), 'c-yellow')}</div><div class="no-data" style="margin-top:6px">No files configured.</div>`;
+        return;
+      }
+
+      const items = ai.files.map(f => {
+        const badges = [];
+        if (f.truncated) badges.push('<span class="badge badge-warn">truncated</span>');
+        if (f.error) badges.push(`<span class="badge badge-err" title="${esc(f.error)}">error</span>`);
+        const displayPath = f.path || '(unknown)';
+        return `<li>
+          <span class="file-path" title="${esc(displayPath)}">${esc(displayPath)}</span>
+          <span class="file-tokens">${fmt(f.tokens)}t</span>
+          ${badges.join('')}
+        </li>`;
+      }).join('');
+
+      el.innerHTML = `
+        <div class="kv-grid" style="margin-bottom:8px">
+          ${kv('Total tokens', fmt(ai.totalTokens), 'c-yellow')}
+          ${kv('File count', fmt(ai.files.length), 'c-yellow')}
+        </div>
+        <ul class="file-list">${items}</ul>
+      `;
+    }
+
+    function renderSystemPrompt(ctx) {
+      const el = document.getElementById('body-sysprompt');
+      if (!ctx) { el.innerHTML = '<div class="no-data">No data yet.</div>'; return; }
+      const b = ctx.systemPromptBreakdown;
+      if (b) {
+        el.innerHTML = `
+          <div class="kv-grid">
+            ${kv('Instructions', '~' + fmt(b.instructionTokens) + ' tokens', 'c-gray')}
+            ${kv('Always-include', fmt(b.alwaysIncludeTokens) + ' tokens', 'c-yellow')}
+            ${kv('Recent context', fmt(b.recentContextTokens) + ' tokens', 'c-blue')}
+            ${kv('RAG content', fmt(b.ragTokens) + ' tokens', 'c-magenta')}
+          </div>
+          <div style="border-top:1px solid var(--border);margin:6px 0;"></div>
+          <div class="kv-grid">
+            ${kv('Total', fmt(b.totalTokens) + ' tokens', 'c-white')}
+          </div>
+        `;
+      } else {
+        el.innerHTML = `
+          <div class="kv-grid">
+            ${kv('Estimated tokens', fmt(ctx.systemPromptLength), 'c-gray')}
+          </div>
+        `;
+      }
+    }
+
+    function renderHistory(state) {
+      const el = document.getElementById('body-history');
+      if (!state || !state.history || state.history.length === 0) {
+        el.innerHTML = '<div class="no-data">No history.</div>';
+        return;
+      }
+      const rows = state.history.slice(-20).reverse().map(h => {
+        const time = h.timestamp ? new Date(h.timestamp).toLocaleTimeString() : '—';
+        const ttft = h.ttft != null ? h.ttft + 'ms' : '—';
+        const limit = h.contextLimit != null ? fmt(h.contextLimit) : '—';
+        const used = h.tokensUsed != null ? fmt(h.tokensUsed) : '—';
+        const rel = h.relevanceScore != null ? h.relevanceScore.toFixed(2) : '—';
+        return `<tr>
+          <td class="c-muted">${esc(time)}</td>
+          <td class="c-cyan">${esc(ttft)}</td>
+          <td class="c-white">${esc(limit)}</td>
+          <td class="c-white">${esc(used)}</td>
+          <td class="c-green">${esc(rel)}</td>
+        </tr>`;
+      }).join('');
+
+      el.innerHTML = `
+        <table class="hist-table">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>TTFT</th>
+              <th>Ctx Limit</th>
+              <th>Tokens Used</th>
+              <th>Relevance</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      `;
+    }
+
+    // ── Main data fetch ───────────────────────────────────────────────────────
+
+    async function refresh() {
+      const thread = selectedThread;
+      if (!thread) {
+        setStatus('No thread selected.');
+        return;
+      }
+      setStatus('Loading…');
+      try {
+        const { debugContext, adaptiveState } = await window.debugAPI.getDebugState(thread);
+        renderTurn(debugContext);
+        renderAdaptive(adaptiveState);
+        renderBudget(debugContext);
+        renderRetrieval(debugContext);
+        renderAlwaysInclude(debugContext);
+        renderSystemPrompt(debugContext);
+        renderHistory(adaptiveState);
+        document.getElementById('lastUpdated').textContent = new Date().toLocaleTimeString();
+        setStatus('OK');
+      } catch (err) {
+        setStatus('Error: ' + err.message);
+      }
+    }
+
+    function setStatus(msg) {
+      document.getElementById('statusBar').textContent = msg;
+    }
+
+    function startAutoRefresh() {
+      stopAutoRefresh();
+      autoRefreshTimer = setInterval(() => {
+        if (selectedThread) refresh();
+      }, 2000);
+    }
+
+    function stopAutoRefresh() {
+      if (autoRefreshTimer) {
+        clearInterval(autoRefreshTimer);
+        autoRefreshTimer = null;
+      }
+    }
+
+    // ── Init ─────────────────────────────────────────────────────────────────
+
+    async function init() {
+      // Populate thread dropdown
+      let threads = [];
+      try {
+        threads = await window.debugAPI.listThreads();
+      } catch (e) {
+        setStatus('Could not list threads: ' + e.message);
+      }
+
+      const select = document.getElementById('threadSelect');
+      threads.forEach(name => {
+        const opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = name;
+        select.appendChild(opt);
+      });
+
+      // Try to pre-select the active thread
+      let activeThread = null;
+      try {
+        activeThread = await window.debugAPI.getActiveThread();
+      } catch { /* ok */ }
+
+      if (activeThread && threads.includes(activeThread)) {
+        select.value = activeThread;
+        selectedThread = activeThread;
+      } else if (threads.length > 0) {
+        select.value = threads[0];
+        selectedThread = threads[0];
+      }
+
+      select.addEventListener('change', () => {
+        selectedThread = select.value || null;
+        refresh();
+      });
+
+      document.getElementById('refreshBtn').addEventListener('click', refresh);
+
+      const autoRefreshCheckbox = document.getElementById('autoRefresh');
+      autoRefreshCheckbox.addEventListener('change', () => {
+        if (autoRefreshCheckbox.checked) {
+          startAutoRefresh();
+        } else {
+          stopAutoRefresh();
+        }
+      });
+
+      if (selectedThread) refresh();
+      startAutoRefresh();
+    }
+
+    init().catch(err => setStatus('Init error: ' + err.message));
+  </script>
+</body>
+</html>
