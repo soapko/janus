@@ -9,8 +9,8 @@
     "start": "npm run build:chat && electron-forge start",
     "build:chat": "esbuild src/cumulus/index.tsx --bundle --outfile=dist/cumulus-chat.js --platform=browser --target=chrome120 --loader:.css=css --define:process.env.NODE_ENV='\"production\"'",
     "watch:chat": "esbuild src/cumulus/index.tsx --bundle --outfile=dist/cumulus-chat.js --platform=browser --target=chrome120 --loader:.css=css --watch",
-    "package": "npm run build:chat && electron-forge package",
-    "make": "npm run build:chat && electron-forge make",
+    "package": "npm run build:chat && node scripts/fix-vad-web.js && electron-forge package",
+    "make": "npm run build:chat && node scripts/fix-vad-web.js && electron-forge make",
     "rebuild": "electron-rebuild -f -w node-pty",
     "test:browser": "node test-browser.js"
   },
