@@ -65,6 +65,18 @@
   font-weight: 500;
 }
 
+.chat-header__thread-info--clickable {
+  cursor: pointer;
+  border-radius: 0.3em;
+  padding: 0.1em 0.4em;
+  margin: -0.1em -0.4em;
+  transition: background 0.15s ease;
+}
+
+.chat-header__thread-info--clickable:hover {
+  background: #3a3a3a;
+}
+
 .chat-header__actions {
   display: flex;
   gap: 0.3em;

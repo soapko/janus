@@ -358,7 +358,15 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
   return (
     <div className={`chat-panel${showVerbose ? ' chat-panel--verbose' : ''}`}>
       <div className="chat-header">
-        <div className="chat-header__thread-info">
+        <div
+          className={`chat-header__thread-info${gitBranch && gitDirtyCount > 0 ? ' chat-header__thread-info--clickable' : ''}`}
+          onClick={() => {
+            if (gitBranch && gitDirtyCount > 0) {
+              handleSend('commit all unsaved changes', []);
+            }
+          }}
+          title={gitBranch && gitDirtyCount > 0 ? 'Click to commit all unsaved changes' : undefined}
+        >
           {gitBranch ? (
             <>
               <span className="chat-header__git-branch">{gitBranch}</span>
