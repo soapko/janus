@@ -4,18 +4,44 @@
  * Dynamically imports Cumulus ESM library into Janus's CJS main process.
  * Manages threads, spawns Claude subprocesses, and streams responses via IPC.
  *
- * As of cumulus v0.10.0, most pipeline helpers (prompt generation, stream parsing,
- * MCP config, binary resolution) are imported from the library. Janus retains
- * subprocess lifecycle management for pool gating, kill support, and message queuing.
+ * As of cumulus v0.10.1, the full message pipeline (externalize → persist →
+ * RAG → prompt → spawn → stream → persist response → adaptive recording)
+ * is delegated to lib.sendMessage(). Janus retains subprocess pool gating,
+ * IPC streaming, kill support, and message queuing.
  */
 
-const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const https = require('https');
+const http = require('http');
 
 const CUMULUS_DIR = path.join(os.homedir(), '.cumulus');
 const THREADS_DIR = path.join(CUMULUS_DIR, 'threads');
+const GATEWAY_CONFIG_PATH = path.join(CUMULUS_DIR, 'gateway.json');
+
+// Cached gateway config (reloaded on each sendMessage to pick up changes)
+let _gatewayConfig = null;
+let _gatewayConfigMtime = 0;
+
+function loadGatewayConfig() {
+  try {
+    if (!fs.existsSync(GATEWAY_CONFIG_PATH)) {
+      _gatewayConfig = { enabled: false };
+      return _gatewayConfig;
+    }
+    const stat = fs.statSync(GATEWAY_CONFIG_PATH);
+    if (stat.mtimeMs !== _gatewayConfigMtime) {
+      _gatewayConfigMtime = stat.mtimeMs;
+      const raw = fs.readFileSync(GATEWAY_CONFIG_PATH, 'utf-8');
+      _gatewayConfig = JSON.parse(raw);
+    }
+    return _gatewayConfig;
+  } catch (err) {
+    console.error('[Bridge] Failed to load gateway config:', err.message);
+    return { enabled: false };
+  }
+}
 
 // Lazy-loaded Cumulus modules (ESM)
 let cumulus = null;
@@ -60,10 +86,12 @@ class CumulusBridge {
     this.pool = pool;            // SubprocessPool (shared across bridges)
     this.sharedMcpPort = sharedMcpPort; // Shared cumulus-history MCP server port (null = use per-agent full server)
     this._destroyed = false;     // Safety flag for queued-then-destroyed
-    this.threads = new Map(); // threadName -> { history, content, session, mcpConfigPath, threadPath, adaptive }
+    this.threads = new Map(); // threadName -> ThreadState
     this.activeProcesses = new Map(); // threadName -> ChildProcess
     this.messageQueues = new Map(); // threadName -> QueuedMessage[]
     this.debugContexts = new Map(); // threadName -> last debug context snapshot
+    this.summaryTimers = new Map(); // threadName -> setTimeout handle
+    this._syncRetryTimers = new Map(); // threadName -> retry setTimeout handle
   }
 
   async initialize() {
@@ -77,46 +105,29 @@ class CumulusBridge {
     }
 
     const lib = await loadCumulus();
-
-    // Use cumulus's cached thread state (history, content, session, adaptive)
     const threadState = await lib.getOrCreateThread(threadName);
-
-    // Generate MCP config with janus-agents as extra server
-    const agentsMcpPath = path.resolve(__dirname, 'janus-agents-mcp.js');
-    const nodePath = lib.resolveNode();
-    const mcpConfigPath = lib.generateMcpConfig(
-      threadState.threadPath,
-      threadState.session.getSessionId(),
-      threadName,
-      this.sharedMcpPort,
-      {
-        'janus-agents': {
-          command: nodePath,
-          args: [agentsMcpPath],
-          env: {
-            JANUS_API_URL: 'http://localhost:9223',
-            JANUS_AGENT_NAME: threadName,
-          },
-        },
-      }
-    );
-
-    const thread = { ...threadState, mcpConfigPath };
-    this.threads.set(threadName, thread);
-    return thread;
+    this.threads.set(threadName, threadState);
+    return threadState;
   }
 
   /**
    * Resolve the working directory for a thread.
-   * Fallback chain: threadConfig.projectDir → sibling folder match → this.projectPath → homedir
+   * Fallback chain: project.path → threadConfig.projectDir → sibling folder match → this.projectPath → homedir
    */
   async resolveThreadCwd(threadName) {
     const lib = await loadCumulus();
 
-    // 1. Check thread config for explicit projectDir
+    // 1. Check thread config for project binding or explicit projectDir
     const globalConfig = await lib.loadGlobalConfig();
     const threadConfig = await lib.loadThreadConfig(threadName);
     const mergedConfig = lib.mergeConfigs(globalConfig, threadConfig);
+
+    // 1a. Project binding (from "Start Project" feature)
+    if (mergedConfig.project?.path && fs.existsSync(mergedConfig.project.path)) {
+      return mergedConfig.project.path;
+    }
+
+    // 1b. Explicit projectDir
     if (mergedConfig.projectDir && fs.existsSync(mergedConfig.projectDir)) {
       return mergedConfig.projectDir;
     }
@@ -137,7 +148,383 @@ class CumulusBridge {
     return this.projectPath || os.homedir();
   }
 
+  /**
+   * Get the effective mode for a thread: 'local' or 'remote'.
+   * Priority: per-thread override → gateway defaultMode → 'local'.
+   */
+  getThreadMode(threadName) {
+    const gw = loadGatewayConfig();
+    if (!gw.enabled || !gw.url) return 'local';
+    const threadModes = gw.threadModes || {};
+    if (threadModes[threadName]) return threadModes[threadName];
+    return gw.defaultMode || 'local';
+  }
+
+  /**
+   * Set the mode for a specific thread. Persists to gateway.json.
+   * When switching Local → Remote, syncs full local history first.
+   */
+  async setThreadMode(threadName, mode) {
+    const currentMode = this.getThreadMode(threadName);
+    const gw = loadGatewayConfig();
+
+    // Sync full local history to gateway before switching to remote
+    if (currentMode === 'local' && mode === 'remote' && gw.enabled && gw.url) {
+      await this.syncFullHistory(threadName, gw);
+    }
+
+    if (!gw.threadModes) gw.threadModes = {};
+    if (mode === (gw.defaultMode || 'local')) {
+      delete gw.threadModes[threadName];
+    } else {
+      gw.threadModes[threadName] = mode;
+    }
+    fs.writeFileSync(GATEWAY_CONFIG_PATH, JSON.stringify(gw, null, 2));
+    _gatewayConfigMtime = fs.statSync(GATEWAY_CONFIG_PATH).mtimeMs;
+    _gatewayConfig = gw;
+  }
+
+  /**
+   * Sync full local history for a thread to the gateway.
+   * Gateway deduplicates by message ID — safe to call repeatedly.
+   */
+  async syncFullHistory(threadName, gw) {
+    const thread = await this.getOrCreateThread(threadName);
+    if (!thread.history) {
+      console.warn(`[Bridge] No local history for "${threadName}" — skipping sync`);
+      return { synced: 0, skipped: 0 };
+    }
+
+    const allMessages = await thread.history.getAll();
+    if (allMessages.length === 0) {
+      console.log(`[Bridge] No messages to sync for "${threadName}"`);
+      return { synced: 0, skipped: 0 };
+    }
+
+    const messages = allMessages.map(m => ({
+      id: m.id,
+      role: m.role,
+      content: m.content,
+    }));
+
+    console.log(`[Bridge] Syncing ${messages.length} messages for "${threadName}" to gateway...`);
+
+    return new Promise((resolve, reject) => {
+      const url = new URL(`/api/thread/${encodeURIComponent(threadName)}/sync`, gw.url);
+      const isHttps = url.protocol === 'https:';
+      const transport = isHttps ? https : http;
+
+      const body = JSON.stringify({ messages });
+
+      const options = {
+        method: 'POST',
+        hostname: url.hostname,
+        port: url.port || (isHttps ? 443 : 80),
+        path: url.pathname,
+        headers: {
+          'Content-Type': 'application/json',
+          ...(gw.apiKey ? { 'X-API-Key': gw.apiKey } : {}),
+        },
+        rejectUnauthorized: false,
+      };
+
+      const req = transport.request(options, (res) => {
+        let responseBody = '';
+        res.on('data', chunk => responseBody += chunk);
+        res.on('end', () => {
+          if (res.statusCode === 200) {
+            try {
+              const result = JSON.parse(responseBody);
+              console.log(`[Bridge] Sync complete for "${threadName}": synced=${result.synced}, skipped=${result.skipped}`);
+              resolve(result);
+            } catch {
+              resolve({ synced: messages.length, skipped: 0 });
+            }
+          } else {
+            console.error(`[Bridge] Sync failed for "${threadName}": ${res.statusCode} ${responseBody}`);
+            reject(new Error(`Sync failed: ${res.statusCode}`));
+          }
+        });
+      });
+
+      req.on('error', (err) => {
+        console.error(`[Bridge] Sync error for "${threadName}":`, err.message);
+        reject(err);
+      });
+
+      req.write(body);
+      req.end();
+    });
+  }
+
+  /**
+   * Route messages to local or remote based on per-thread mode.
+   */
   async sendMessage(threadName, messageText, win, attachments = []) {
+    const gw = loadGatewayConfig();
+    const mode = this.getThreadMode(threadName);
+    if (mode === 'remote' && gw.enabled && gw.url) {
+      return this.sendMessageRemote(threadName, messageText, win, attachments, gw);
+    }
+    return this.sendMessageLocal(threadName, messageText, win, attachments);
+  }
+
+  /**
+   * Send message via remote cumulus gateway (SSE stream).
+   * No local subprocess, pool, history, or RAG — gateway handles everything.
+   */
+  async sendMessageRemote(threadName, messageText, win, attachments, gw) {
+    // Register thread locally for getActiveAgents tracking
+    if (!this.threads.has(threadName)) {
+      this.threads.set(threadName, { name: threadName, remote: true });
+    }
+
+    // Send user message to renderer immediately
+    const tempUserMsg = {
+      id: `msg-${Date.now()}`,
+      timestamp: Date.now(),
+      role: 'user',
+      content: messageText,
+      attachments: attachments.length > 0 ? attachments.map(att => ({
+        id: att.name, name: att.name, path: att.path, type: att.type, mimeType: att.mimeType,
+      })) : undefined,
+    };
+    win.webContents.send('cumulus:message', { threadName, message: tempUserMsg });
+
+    // Mark as active (for queue gating — use a sentinel instead of a real process)
+    const sentinel = { kill: () => {} };
+    this.activeProcesses.set(threadName, sentinel);
+
+    try {
+      const response = await this._sseRequest(gw, threadName, messageText, attachments, win);
+      return response;
+    } catch (err) {
+      console.error('[Bridge] sendMessageRemote error:', err);
+      win.webContents.send('cumulus:error', {
+        threadName,
+        error: err.message || String(err),
+      });
+      return null;
+    } finally {
+      this.activeProcesses.delete(threadName);
+      this.drainQueue(threadName, win);
+    }
+  }
+
+  /**
+   * Make an SSE request to the gateway and wire events to IPC.
+   */
+  _sseRequest(gw, threadName, message, attachments, win) {
+    return new Promise((resolve, reject) => {
+      const url = new URL(`/api/thread/${encodeURIComponent(threadName)}/message`, gw.url);
+      const isHttps = url.protocol === 'https:';
+      const transport = isHttps ? https : http;
+
+      const body = JSON.stringify({
+        message,
+        images: attachments.filter(a => a.type === 'image').map(a => a.path),
+      });
+
+      const options = {
+        method: 'POST',
+        hostname: url.hostname,
+        port: url.port || (isHttps ? 443 : 80),
+        path: url.pathname,
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'text/event-stream',
+          ...(gw.apiKey ? { 'X-API-Key': gw.apiKey } : {}),
+        },
+        // Accept self-signed certs for local dev (thundercat)
+        rejectUnauthorized: false,
+      };
+
+      const req = transport.request(options, (res) => {
+        if (res.statusCode !== 200) {
+          let errorBody = '';
+          res.on('data', chunk => errorBody += chunk);
+          res.on('end', () => {
+            reject(new Error(`Gateway returned ${res.statusCode}: ${errorBody}`));
+          });
+          return;
+        }
+
+        let responseText = null;
+        let buffer = '';
+
+        res.setEncoding('utf-8');
+        res.on('data', (chunk) => {
+          buffer += chunk;
+          // Parse SSE frames
+          const lines = buffer.split('\n');
+          buffer = lines.pop(); // keep incomplete line
+
+          let eventType = null;
+          for (const line of lines) {
+            if (line.startsWith('event: ')) {
+              eventType = line.slice(7).trim();
+            } else if (line.startsWith('data: ')) {
+              const dataStr = line.slice(6);
+              try {
+                const data = JSON.parse(dataStr);
+                this._handleSSEEvent(eventType || 'token', data, threadName, win);
+                if (eventType === 'done') {
+                  responseText = data.response || '';
+                  // Store gateway stats as debug context
+                  this.debugContexts.set(threadName, {
+                    remote: true,
+                    ttft: data.ttft,
+                    tokensIn: data.tokensIn,
+                    tokensOut: data.tokensOut,
+                    gatewayUrl: gw.url,
+                  });
+                }
+              } catch { /* ignore malformed JSON */ }
+              eventType = null;
+            }
+          }
+        });
+
+        res.on('end', () => {
+          // Process any remaining buffer
+          if (buffer.trim()) {
+            const remaining = buffer.split('\n');
+            let eventType = null;
+            for (const line of remaining) {
+              if (line.startsWith('event: ')) {
+                eventType = line.slice(7).trim();
+              } else if (line.startsWith('data: ')) {
+                try {
+                  const data = JSON.parse(line.slice(6));
+                  this._handleSSEEvent(eventType || 'token', data, threadName, win);
+                  if (eventType === 'done') {
+                    responseText = data.response || '';
+                    this.debugContexts.set(threadName, {
+                      remote: true,
+                      ttft: data.ttft,
+                      tokensIn: data.tokensIn,
+                      tokensOut: data.tokensOut,
+                      gatewayUrl: gw.url,
+                    });
+                  }
+                } catch { /* ignore */ }
+                eventType = null;
+              }
+            }
+          }
+          resolve(responseText);
+        });
+
+        res.on('error', reject);
+      });
+
+      req.on('error', (err) => {
+        // Network error — gateway unreachable
+        if (err.code === 'ECONNREFUSED' || err.code === 'ENOTFOUND' || err.code === 'ETIMEDOUT') {
+          reject(new Error(`Gateway at ${gw.url} is unreachable (${err.code}). Check gateway status or switch to local mode.`));
+        } else {
+          reject(err);
+        }
+      });
+
+      req.write(body);
+      req.end();
+    });
+  }
+
+  /**
+   * Handle a single SSE event from the gateway.
+   */
+  _handleSSEEvent(eventType, data, threadName, win) {
+    switch (eventType) {
+      case 'token':
+        win.webContents.send('cumulus:stream-chunk', { threadName, text: data.text });
+        break;
+      case 'segment':
+        win.webContents.send('cumulus:stream-segment', { threadName, segment: data });
+        break;
+      case 'tool':
+        // Show tool usage as a segment
+        win.webContents.send('cumulus:stream-segment', {
+          threadName,
+          segment: { type: 'tool', name: data.name, input: data.input },
+        });
+        break;
+      case 'done':
+        win.webContents.send('cumulus:stream-end', {
+          threadName,
+          fallbackText: data.response,
+          segments: [],
+        });
+        break;
+      case 'error':
+        win.webContents.send('cumulus:error', {
+          threadName,
+          error: data.error || 'Unknown gateway error',
+        });
+        break;
+    }
+  }
+
+  /**
+   * Sync messages to the gateway (fire-and-forget with exponential backoff retry).
+   * Used in local mode to keep gateway history in sync.
+   */
+  _syncToGateway(gw, threadName, messages, attempt = 0) {
+    const url = new URL(`/api/thread/${encodeURIComponent(threadName)}/sync`, gw.url);
+    const isHttps = url.protocol === 'https:';
+    const transport = isHttps ? https : http;
+
+    const body = JSON.stringify({ messages });
+
+    const options = {
+      method: 'POST',
+      hostname: url.hostname,
+      port: url.port || (isHttps ? 443 : 80),
+      path: url.pathname,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(gw.apiKey ? { 'X-API-Key': gw.apiKey } : {}),
+      },
+      rejectUnauthorized: false,
+    };
+
+    const req = transport.request(options, (res) => {
+      let responseBody = '';
+      res.on('data', chunk => responseBody += chunk);
+      res.on('end', () => {
+        if (res.statusCode === 200) {
+          console.log(`[Bridge] Synced ${messages.length} messages for "${threadName}" to gateway`);
+        } else if (attempt < 3) {
+          const delay = 1000 * Math.pow(2, attempt); // 1s, 2s, 4s
+          console.warn(`[Bridge] Sync failed (${res.statusCode}), retrying in ${delay}ms...`);
+          const timer = setTimeout(() => this._syncToGateway(gw, threadName, messages, attempt + 1), delay);
+          this._syncRetryTimers.set(`${threadName}-${Date.now()}`, timer);
+        } else {
+          console.error(`[Bridge] Sync failed after ${attempt + 1} attempts for "${threadName}": ${responseBody}`);
+        }
+      });
+    });
+
+    req.on('error', (err) => {
+      if (attempt < 3) {
+        const delay = 1000 * Math.pow(2, attempt);
+        console.warn(`[Bridge] Sync error (${err.code}), retrying in ${delay}ms...`);
+        const timer = setTimeout(() => this._syncToGateway(gw, threadName, messages, attempt + 1), delay);
+        this._syncRetryTimers.set(`${threadName}-${Date.now()}`, timer);
+      } else {
+        console.error(`[Bridge] Sync failed after ${attempt + 1} attempts for "${threadName}":`, err.message);
+      }
+    });
+
+    req.write(body);
+    req.end();
+  }
+
+  /**
+   * Send message locally via Claude subprocess (original path).
+   */
+  async sendMessageLocal(threadName, messageText, win, attachments = []) {
     // Gate through subprocess pool (Layer 2 throttling)
     if (this.pool) {
       await this.pool.acquire(threadName);
@@ -148,435 +535,121 @@ class CumulusBridge {
     }
 
     const lib = await loadCumulus();
-    const thread = await this.getOrCreateThread(threadName);
 
-    // Build image content blocks for multimodal messages
-    const imageBlocks = [];
-    let messageForClaude = messageText;
+    // Register thread in local map (for getActiveAgents, etc.)
+    await this.getOrCreateThread(threadName);
 
-    if (attachments && attachments.length > 0) {
-      const fileRefs = [];
-      for (const att of attachments) {
-        if (att.type === 'image' && att.path) {
-          try {
-            const data = fs.readFileSync(att.path);
-            const base64 = data.toString('base64');
-            const ext = path.extname(att.path).toLowerCase().replace('.', '');
-            const mimeMap = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp' };
-            const mediaType = att.mimeType || mimeMap[ext] || 'image/png';
-            imageBlocks.push({
-              type: 'image',
-              source: { type: 'base64', media_type: mediaType, data: base64 },
-            });
-          } catch (err) {
-            console.error('[CumulusBridge] Failed to read image:', att.path, err);
-            fileRefs.push(`[Attached image (unreadable): ${att.path}]`);
-          }
-        } else {
-          fileRefs.push(`[Attached file: ${att.path}]`);
-        }
-      }
-      if (fileRefs.length > 0) {
-        messageForClaude = messageForClaude
-          ? messageForClaude + '\n\n' + fileRefs.join('\n')
-          : fileRefs.join('\n');
-      }
-    }
-
-    const hasImages = imageBlocks.length > 0;
-
-    // Create fresh budget
-    const budget = new lib.ContextBudget();
-
-    // Check if user input should be externalized
-    if (lib.shouldExternalizeUserInput && lib.shouldExternalizeUserInput(messageForClaude, budget)) {
-      const { replacement } = await lib.externalizeUserInput(messageForClaude, thread.content);
-      messageForClaude = replacement;
-    } else {
-      budget.consume(lib.estimateTokens(messageForClaude));
-    }
-
-    // Save user message to history (attachments get copied to persistent storage by cumulus)
-    let userMessage = await thread.history.append({
+    // Send user message to renderer immediately for display
+    const tempUserMsg = {
+      id: `msg-${Date.now()}`,
+      timestamp: Date.now(),
       role: 'user',
       content: messageText,
-      metadata: {
-        sessionId: thread.session.getSessionId(),
-      },
       attachments: attachments.length > 0 ? attachments.map(att => ({
+        id: att.name,
         name: att.name,
+        path: att.path,
         type: att.type,
         mimeType: att.mimeType,
-        storedPath: att.path, // Janus uses `path`, cumulus expects `storedPath`
       })) : undefined,
-    });
-
-    // Resolve relative storedPaths to absolute (append() returns relative,
-    // resolveAttachmentPaths only runs on getAll/getRecent)
-    if (userMessage.attachments?.length) {
-      const threadDir = path.dirname(thread.threadPath);
-      userMessage = {
-        ...userMessage,
-        attachments: userMessage.attachments.map(att => ({
-          ...att,
-          storedPath: path.isAbsolute(att.storedPath) ? att.storedPath : path.join(threadDir, att.storedPath),
-        })),
-      };
-    }
-
-    // Send user message back to renderer (map storedPath -> path for frontend)
-    win.webContents.send('cumulus:message', {
-      threadName,
-      message: mapMessageForRenderer(userMessage),
-    });
-
-    // Get stats
-    const stats = await thread.history.getStats();
-
-    // Get recent messages
-    const recentMessages = await thread.history.getRecent(lib.RECENT_CONTEXT_COUNT);
-    const recentConversation = recentMessages
-      .filter(m => m.role !== 'session')
-      .map(m => ({ role: m.role, content: m.content }));
+    };
+    win.webContents.send('cumulus:message', { threadName, message: tempUserMsg });
 
     // Resolve per-thread working directory
     const threadCwd = await this.resolveThreadCwd(threadName);
 
-    // Load always-include files (use thread cwd for relative path resolution)
-    const globalConfig = await lib.loadGlobalConfig();
-    const threadConfig = await lib.loadThreadConfig(threadName);
-    const mergedConfig = lib.mergeConfigs(globalConfig, threadConfig);
-    const alwaysInclude = await lib.readAlwaysIncludeFiles(mergedConfig, threadCwd);
+    // Build extra MCP servers config (janus-agents)
+    const agentsMcpPath = path.resolve(__dirname, 'janus-agents-mcp.js');
+    const nodePath = lib.resolveNode();
 
-    // Calculate RAG budget using adaptive limit, with optional preset override
-    const adaptiveBudget = thread.adaptive.getTotalContextBudget();
-    const userQueryTokens = lib.estimateTokens(messageText);
-    const overhead = userQueryTokens + alwaysInclude.totalTokens + lib.RECENT_CONTEXT_BUDGET;
-    const effectiveBudget = lib.resolveRagBudget
-      ? lib.resolveRagBudget(mergedConfig, adaptiveBudget, overhead)
-      : adaptiveBudget;
-    const ragBudget = Math.max(
-      0,
-      effectiveBudget - userQueryTokens - alwaysInclude.totalTokens - lib.RECENT_CONTEXT_BUDGET
-    );
-
-    // Run RAG retrieval
-    let retrievalResult = null;
     try {
-      const threadPath = getThreadPath(threadName);
-      const sessionsPath = threadPath.replace(/\.jsonl$/, '.sessions');
-      const allMessages = await thread.history.getAll();
-      const totalMessages = allMessages.length;
-      retrievalResult = await lib.retrieve(messageText, thread.history, thread.content, {
-        budgetTokens: ragBudget,
-        currentSessionId: thread.session.getSessionId(),
-        sessionsPath,
-        recentMessages: recentConversation,
-        totalMessages,
+      const result = await lib.sendMessage({
+        threadName,
+        message: messageText,
+        attachments: attachments.map(att => ({
+          name: att.name,
+          type: att.type,
+          mimeType: att.mimeType,
+          path: att.path,
+        })),
+        sharedMcpPort: this.sharedMcpPort,
+        projectDir: threadCwd,
+        extraMcpServers: {
+          'janus-agents': {
+            command: nodePath,
+            args: [agentsMcpPath],
+            env: {
+              JANUS_API_URL: 'http://localhost:9223',
+              JANUS_AGENT_NAME: threadName,
+            },
+          },
+        },
+        onSpawn: (proc) => this.activeProcesses.set(threadName, proc),
+        onToken: (text) => {
+          win.webContents.send('cumulus:stream-chunk', { threadName, text });
+        },
+        onSegment: (seg) => {
+          win.webContents.send('cumulus:stream-segment', { threadName, segment: seg });
+        },
+        onError: (err) => {
+          win.webContents.send('cumulus:error', { threadName, error: err });
+        },
       });
-    } catch (err) {
-      console.error('[CumulusBridge] Retrieval error:', err);
-    }
 
-    const retrievedContext = retrievalResult?.context ?? '';
+      // Store debug snapshot for Context Inspector
+      this.debugContexts.set(threadName, result.debug);
 
-    // Capture debug context snapshot for the Context Inspector
-    this.debugContexts.set(threadName, {
-      timestamp: Date.now(),
-      threadName,
-      sessionId: thread.session.getSessionId(),
-      messageCount: stats.count,
-      tokenCount: stats.totalTokens,
-      userMessage: messageText,
-      budget: {
-        total: adaptiveBudget,
-        userQuery: userQueryTokens,
-        alwaysInclude: alwaysInclude.totalTokens,
-        recentContext: lib.RECENT_CONTEXT_BUDGET,
-        ragAvailable: ragBudget,
-        ragUsed: retrievalResult?.tokensUsed ?? 0,
-      },
-      retrieval: retrievalResult ? {
-        historyCount: retrievalResult.historyCount ?? 0,
-        contentCount: retrievalResult.contentCount ?? 0,
-        tokensUsed: retrievalResult.tokensUsed ?? 0,
-        avgRelevance: lib.computeAvgRelevance(retrievalResult.debug),
-        queryType: retrievalResult.debug?.queryType ?? 'unknown',
-      } : null,
-      alwaysInclude: {
-        files: alwaysInclude.files?.map(f => ({
-          path: f.path || f.resolvedPath,
-          tokens: f.tokens || 0,
-          truncated: !!f.truncated,
-          error: f.error || null,
-        })) || [],
-        totalTokens: alwaysInclude.totalTokens,
-      },
-      recentMessageCount: recentMessages.length,
-      systemPromptLength: 0, // updated after generateSystemPrompt
-    });
-
-    // Generate system prompt (using cumulus lib helpers)
-    const systemPrompt = lib.generateSystemPrompt(
-      stats.count,
-      stats.totalTokens,
-      thread.session.getSessionId(),
-      recentConversation,
-      retrievedContext,
-      alwaysInclude.formattedContext
-    );
-
-    // Update debug context with system prompt token estimate + breakdown
-    const debugCtx = this.debugContexts.get(threadName);
-    if (debugCtx) {
-      const systemPromptTokens = lib.estimateTokens(systemPrompt);
-      const ragTokens = retrievalResult ? lib.estimateTokens(retrievedContext) : 0;
-      const recentContext = lib.formatRecentContext(recentConversation, lib.RECENT_CONTEXT_BUDGET);
-      const recentContextTokens = lib.estimateTokens(recentContext);
-      const alwaysIncludeTokens = alwaysInclude.totalTokens;
-      const instructionTokens = systemPromptTokens - ragTokens - alwaysIncludeTokens - recentContextTokens;
-
-      debugCtx.systemPromptLength = systemPromptTokens;
-      debugCtx.systemPromptBreakdown = {
-        instructionTokens,
-        alwaysIncludeTokens,
-        recentContextTokens,
-        ragTokens,
-        totalTokens: systemPromptTokens,
-      };
-    }
-
-    // Create stream processor for content externalization
-    const streamProcessor = new lib.StreamProcessor({
-      budget,
-      contentStore: thread.content,
-    });
-
-    // Prepend system reminder for file reading tools
-    messageForClaude = lib.FILE_READ_REMINDER + messageForClaude;
-
-    // Spawn Claude
-    const args = [
-      '--print',
-      '--verbose',
-      '--output-format', 'stream-json',
-      '--permission-mode', 'bypassPermissions',
-      '--mcp-config', thread.mcpConfigPath,
-      '--append-system-prompt', systemPrompt,
-    ];
-
-    if (hasImages) {
-      // Multimodal: pipe content blocks via stdin
-      args.push('--input-format', 'stream-json');
-    } else {
-      // Text-only: pass as positional argument
-      args.push(messageForClaude);
-    }
-
-    // Filter out Claude env vars and inject window ID
-    const cleanEnv = Object.fromEntries(
-      Object.entries(process.env).filter(
-        ([key]) => !key.startsWith('CLAUDE') && key !== 'CLAUDECODE'
-      )
-    );
-    if (this.windowId != null) {
-      cleanEnv.JANUS_WINDOW_ID = String(this.windowId);
-    }
-
-    const claudePath = lib.resolveClaudeCli();
-    const claude = spawn(claudePath, args, {
-      stdio: [hasImages ? 'pipe' : 'ignore', 'pipe', 'pipe'],
-      env: cleanEnv,
-      cwd: threadCwd,
-    });
-
-    // For multimodal messages, write content blocks to stdin
-    if (hasImages && claude.stdin) {
-      const contentBlocks = [
-        ...imageBlocks,
-        { type: 'text', text: messageForClaude || '' },
-      ];
-      const payload = JSON.stringify({
-        type: 'user',
-        message: { role: 'user', content: contentBlocks },
+      // Send completion to renderer
+      win.webContents.send('cumulus:stream-end', {
+        threadName,
+        message: result.assistantMessage,
+        fallbackText: result.response,
+        segments: result.segments,
       });
-      claude.stdin.write(payload + '\n');
-      claude.stdin.end();
-    }
 
-    this.activeProcesses.set(threadName, claude);
-
-    let fullResponse = '';
-    let buffer = '';
-    const pendingLines = [];
-    const collectedSegments = [];
-
-    // TTFT measurement: time from spawn to first text chunk
-    const spawnTime = Date.now();
-    let ttft = null;
-
-    const processLine = async (line) => {
-      if (!line.trim()) return;
-
-      let processed;
-      try {
-        processed = await streamProcessor.processLine(line);
-      } catch {
-        processed = { line, modified: false, eventType: 'unknown' };
-      }
-
-      // Existing text-only flow (backward compat)
-      const text = lib.extractTextFromStreamLine(processed.line);
-      if (text) {
-        // Capture TTFT on first text output
-        if (ttft === null) {
-          ttft = Date.now() - spawnTime;
-        }
-        if (fullResponse && !fullResponse.endsWith('\n')) {
-          fullResponse += '\n\n';
-          win.webContents.send('cumulus:stream-chunk', { threadName, text: '\n\n' });
-        }
-        fullResponse += text;
-        win.webContents.send('cumulus:stream-chunk', { threadName, text });
-      }
-
-      // Structured segments for verbose display
-      const segments = lib.parseStreamSegments(processed.line);
-      for (const seg of segments) {
-        collectedSegments.push(seg);
-        win.webContents.send('cumulus:stream-segment', { threadName, segment: seg });
-      }
-    };
-
-    claude.stdout.on('data', (data) => {
-      buffer += data.toString();
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-
-      for (const line of lines) {
-        pendingLines.push(processLine(line).catch(() => {}));
-      }
-    });
-
-    claude.stderr.on('data', (data) => {
-      const text = data.toString();
-      // Only treat ENOENT as a fatal error — everything else from stderr is
-      // verbose debug output from --verbose and should be ignored.
-      if (text.includes('ENOENT')) {
-        win.webContents.send('cumulus:error', { threadName, error: text });
-      }
-    });
-
-    return new Promise((resolve) => {
-      let completed = false;
-
-      const handleCompletion = async () => {
-        if (completed) return;
-        completed = true;
-        this.activeProcesses.delete(threadName);
-
-        // Release subprocess pool slot
-        if (this.pool) {
-          this.pool.release(threadName);
-        }
-
-        console.log('[Bridge] handleCompletion: fullResponse length =', fullResponse.length);
-
+      // Schedule segment summary generation (fire-and-forget, 5s idle delay)
+      clearTimeout(this.summaryTimers.get(threadName));
+      this.summaryTimers.set(threadName, setTimeout(async () => {
         try {
-          // Save assistant message to history
-          if (fullResponse) {
-            const assistantMessage = await thread.history.append({
-              role: 'assistant',
-              content: fullResponse,
-              metadata: { sessionId: thread.session.getSessionId() },
-            });
-
-            console.log('[Bridge] handleCompletion: saved to history, index =', assistantMessage?.index);
-
-            // Update session (non-critical — don't let failures lose the message)
-            try {
-              const messages = await thread.history.getRecent(2);
-              const userMsg = messages.find(m => m.role === 'user');
-              if (userMsg) {
-                await thread.session.appendExchange(userMsg.content, fullResponse);
-                thread.session.generateMissingEmbeddings().catch(() => {});
-              }
-            } catch (sessionErr) {
-              console.error('[Bridge] session update failed (non-fatal):', sessionErr);
+          const thread = this.threads.get(threadName);
+          if (thread && lib.generatePendingSummaries) {
+            const count = await lib.generatePendingSummaries(thread.threadPath, thread.history);
+            if (count > 0) {
+              console.log(`[cumulus] Generated ${count} segment summaries for ${threadName}`);
             }
-
-            // Record adaptive turn metrics and persist
-            try {
-              const tokensUsed = lib.estimateTokens(fullResponse) + userQueryTokens;
-              thread.adaptive.recordTurn({
-                ttft: ttft ?? (Date.now() - spawnTime), // fallback if no text was streamed
-                tokensUsed,
-                relevanceScore: lib.computeAvgRelevance(retrievalResult?.debug),
-              });
-              await thread.adaptive.save();
-              console.log(`[Bridge] Adaptive turn recorded: TTFT=${ttft}ms, tokens=${tokensUsed}, limit=${thread.adaptive.getContextLimit()}`);
-            } catch (adaptiveErr) {
-              console.error('[Bridge] adaptive budget update failed (non-fatal):', adaptiveErr);
-            }
-
-            console.log('[Bridge] handleCompletion: sending stream-end with message');
-            win.webContents.send('cumulus:stream-end', {
-              threadName,
-              message: assistantMessage,
-              fallbackText: fullResponse,
-              segments: collectedSegments,
-            });
-          } else {
-            console.log('[Bridge] handleCompletion: fullResponse is empty, sending null');
-            win.webContents.send('cumulus:stream-end', {
-              threadName,
-              message: null,
-              fallbackText: null,
-              segments: collectedSegments,
-            });
           }
         } catch (err) {
-          console.error('[Bridge] handleCompletion error:', err);
-          win.webContents.send('cumulus:stream-end', {
-            threadName,
-            message: null,
-            fallbackText: fullResponse || null,
-            segments: collectedSegments,
-          });
+          console.error(`[cumulus] Summary generation failed for ${threadName}:`, err.message);
         }
+      }, 5000));
 
-        resolve(fullResponse);
+      // Sync user+assistant messages to gateway (fire-and-forget, with IDs for dedup)
+      const gw = loadGatewayConfig();
+      if (gw.enabled && gw.url) {
+        const userMsg = result.userMessage || { role: 'user', content: messageText };
+        const asstMsg = result.assistantMessage || { role: 'assistant', content: result.response };
+        this._syncToGateway(gw, threadName, [
+          { id: userMsg.id, role: userMsg.role || 'user', content: userMsg.content || messageText },
+          { id: asstMsg.id, role: asstMsg.role || 'assistant', content: asstMsg.content || result.response },
+        ]);
+      }
 
-        // Drain any messages that arrived while this agent was busy
-        this.drainQueue(threadName, win);
-      };
-
-      claude.on('close', async (code) => {
-        if (buffer.trim()) {
-          pendingLines.push(processLine(buffer).catch(() => {}));
-        }
-        // Wait for ALL pending processLine promises to resolve
-        // before calling handleCompletion — otherwise fullResponse
-        // may be empty due to the race condition.
-        await Promise.all(pendingLines);
-        handleCompletion();
+      return result.response;
+    } catch (err) {
+      console.error('[Bridge] sendMessage error:', err);
+      win.webContents.send('cumulus:error', {
+        threadName,
+        error: err.message || String(err),
       });
-
-      claude.on('error', (err) => {
-        this.activeProcesses.delete(threadName);
-
-        // Release subprocess pool slot on error
-        if (this.pool) {
-          this.pool.release(threadName);
-        }
-
-        const errorMsg = err.message.includes('ENOENT')
-          ? 'Claude CLI not found. Please install it first.'
-          : err.message;
-        win.webContents.send('cumulus:error', { threadName, error: errorMsg });
-        resolve(null);
-      });
-    });
+      return null;
+    } finally {
+      this.activeProcesses.delete(threadName);
+      if (this.pool) {
+        this.pool.release(threadName);
+      }
+      // Drain any messages that arrived while this agent was busy
+      this.drainQueue(threadName, win);
+    }
   }
 
   killProcess(threadName) {
@@ -588,6 +661,10 @@ class CumulusBridge {
   }
 
   async getHistory(threadName, count = 50) {
+    const gw = loadGatewayConfig();
+    if (gw.enabled && gw.url) {
+      return this._fetchJson(gw, `/api/thread/${encodeURIComponent(threadName)}/history?limit=${count}`);
+    }
     const thread = await this.getOrCreateThread(threadName);
     const messages = count <= 0
       ? await thread.history.getAll()
@@ -596,9 +673,55 @@ class CumulusBridge {
   }
 
   async listThreads() {
+    const gw = loadGatewayConfig();
+    if (gw.enabled && gw.url) {
+      return this._fetchJson(gw, '/api/threads');
+    }
     ensureDirectories();
     const files = fs.readdirSync(THREADS_DIR).filter(f => f.endsWith('.jsonl'));
     return files.map(f => f.replace(/\.jsonl$/, ''));
+  }
+
+  /**
+   * Fetch JSON from the gateway API.
+   */
+  _fetchJson(gw, apiPath) {
+    return new Promise((resolve, reject) => {
+      const url = new URL(apiPath, gw.url);
+      const isHttps = url.protocol === 'https:';
+      const transport = isHttps ? https : http;
+
+      const options = {
+        method: 'GET',
+        hostname: url.hostname,
+        port: url.port || (isHttps ? 443 : 80),
+        path: url.pathname + url.search,
+        headers: {
+          'Accept': 'application/json',
+          ...(gw.apiKey ? { 'X-API-Key': gw.apiKey } : {}),
+        },
+        rejectUnauthorized: false,
+      };
+
+      const req = transport.request(options, (res) => {
+        let body = '';
+        res.on('data', chunk => body += chunk);
+        res.on('end', () => {
+          try {
+            resolve(JSON.parse(body));
+          } catch {
+            resolve([]);
+          }
+        });
+      });
+
+      req.on('error', (err) => {
+        console.error(`[Bridge] Gateway fetch error (${apiPath}):`, err.message);
+        resolve([]);
+      });
+
+      req.end();
+    });
   }
 
   async listIncludeFiles(threadName) {
@@ -644,6 +767,120 @@ class CumulusBridge {
     }
     // Most recent first
     return turns.reverse();
+  }
+
+  /**
+   * Get the project bound to a thread (if any).
+   * Returns { name, path } or null.
+   */
+  async getThreadProject(threadName) {
+    const lib = await loadCumulus();
+    const threadConfig = await lib.loadThreadConfig(threadName);
+    if (threadConfig.project) {
+      return threadConfig.project;
+    }
+    return null;
+  }
+
+  /**
+   * List available project templates.
+   * Remote: GET /api/templates. Local: hardcoded defaults.
+   */
+  async listTemplates(threadName) {
+    const mode = this.getThreadMode(threadName);
+    const gw = loadGatewayConfig();
+
+    if (mode === 'remote' && gw.enabled && gw.url) {
+      try {
+        const data = await this._fetchJson(gw, '/api/templates');
+        return data.templates || data || [{ name: 'default' }, { name: 'web-app' }];
+      } catch {
+        return [{ name: 'default' }, { name: 'web-app' }];
+      }
+    }
+
+    return [{ name: 'default' }, { name: 'web-app' }];
+  }
+
+  /**
+   * Create a project and bind it to a thread.
+   * Remote: POST /api/projects. Local: create folder + scaffold + update thread config.
+   */
+  async createProject(threadName, projectName, template = 'default', gitCloneUrl = null) {
+    const mode = this.getThreadMode(threadName);
+    const gw = loadGatewayConfig();
+
+    if (mode === 'remote' && gw.enabled && gw.url) {
+      return new Promise((resolve, reject) => {
+        const url = new URL('/api/projects', gw.url);
+        const isHttps = url.protocol === 'https:';
+        const transport = isHttps ? https : http;
+        const payload = JSON.stringify({
+          name: projectName,
+          template,
+          ...(gitCloneUrl ? { gitCloneUrl } : {}),
+          thread: threadName,
+        });
+
+        const req = transport.request({
+          method: 'POST',
+          hostname: url.hostname,
+          port: url.port || (isHttps ? 443 : 80),
+          path: url.pathname,
+          headers: {
+            'Content-Type': 'application/json',
+            ...(gw.apiKey ? { 'X-API-Key': gw.apiKey } : {}),
+          },
+          rejectUnauthorized: false,
+        }, (res) => {
+          let body = '';
+          res.on('data', chunk => body += chunk);
+          res.on('end', () => {
+            try {
+              const data = JSON.parse(body);
+              if (res.statusCode >= 400) {
+                reject(new Error(data.error || `HTTP ${res.statusCode}`));
+              } else {
+                resolve({ name: data.name || projectName, path: data.path });
+              }
+            } catch {
+              reject(new Error('Invalid response from gateway'));
+            }
+          });
+        });
+        req.on('error', (err) => reject(err));
+        req.write(payload);
+        req.end();
+      });
+    }
+
+    // Local mode: create folder, scaffold, update thread config
+    const lib = await loadCumulus();
+    const projectDir = path.join(os.homedir(), 'Documents', '_Projects', projectName);
+
+    if (gitCloneUrl) {
+      const { execSync } = require('child_process');
+      execSync(`git clone "${gitCloneUrl}" "${projectDir}"`, { stdio: 'pipe' });
+    } else {
+      fs.mkdirSync(projectDir, { recursive: true });
+      if (template === 'web-app') {
+        fs.mkdirSync(path.join(projectDir, 'src'), { recursive: true });
+        fs.mkdirSync(path.join(projectDir, 'public'), { recursive: true });
+      }
+      fs.mkdirSync(path.join(projectDir, 'docs', 'tasks'), { recursive: true });
+      fs.mkdirSync(path.join(projectDir, 'docs', 'decisions'), { recursive: true });
+      if (!fs.existsSync(path.join(projectDir, 'Tasks.md'))) {
+        fs.writeFileSync(path.join(projectDir, 'Tasks.md'), `# ${projectName} Tasks\n`);
+      }
+    }
+
+    // Update thread config with project binding
+    const threadConfig = await lib.loadThreadConfig(threadName);
+    threadConfig.project = { name: projectName, path: projectDir };
+    threadConfig.projectDir = projectDir;
+    await lib.saveThreadConfig(threadName, threadConfig);
+
+    return { name: projectName, path: projectDir };
   }
 
   async revert(threadName, messageId, restoreGit) {
@@ -802,17 +1039,16 @@ class CumulusBridge {
       proc.kill('SIGTERM');
     }
     this.activeProcesses.clear();
-
-    // Clean up MCP configs
-    for (const [, thread] of this.threads) {
-      try {
-        if (thread.mcpConfigPath && fs.existsSync(thread.mcpConfigPath)) {
-          fs.unlinkSync(thread.mcpConfigPath);
-        }
-      } catch { /* ignore */ }
+    for (const timer of this.summaryTimers.values()) {
+      clearTimeout(timer);
     }
+    this.summaryTimers.clear();
+    for (const timer of this._syncRetryTimers.values()) {
+      clearTimeout(timer);
+    }
+    this._syncRetryTimers.clear();
     this.threads.clear();
   }
 }
 
-module.exports = { CumulusBridge };
+module.exports = { CumulusBridge, loadGatewayConfig };

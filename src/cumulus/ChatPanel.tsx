@@ -1,5 +1,5 @@
 import React, { Component, useCallback, useEffect, useRef, useState } from 'react';
-import { Attachment, CumulusChatAPI, Message, StreamSegment } from './types';
+import { Attachment, CumulusChatAPI, Message, ProjectInfo, ProjectTemplate, StreamSegment } from './types';
 import ChatInput from './ChatInput';
 import MessageBubble from './MessageBubble';
 import StreamingResponse from './StreamingResponse';
@@ -58,6 +58,15 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
   });
   const [gitBranch, setGitBranch] = useState<string | null>(null);
   const [gitDirtyCount, setGitDirtyCount] = useState(0);
+  const [mode, setMode] = useState<'local' | 'remote'>('local');
+  const [project, setProject] = useState<ProjectInfo | null>(null);
+  const [showProjectForm, setShowProjectForm] = useState(false);
+  const [templates, setTemplates] = useState<ProjectTemplate[]>([]);
+  const [projectFormName, setProjectFormName] = useState('');
+  const [projectFormTemplate, setProjectFormTemplate] = useState('default');
+  const [projectFormGitUrl, setProjectFormGitUrl] = useState('');
+  const [projectFormError, setProjectFormError] = useState<string | null>(null);
+  const [projectFormLoading, setProjectFormLoading] = useState(false);
 
   const scrollAnchorRef = useRef<HTMLDivElement>(null);
   const messageListRef = useRef<HTMLDivElement>(null);
@@ -108,11 +117,13 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
     };
   }, [api, scrollToBottom]);
 
-  // Poll git branch and dirty count
+  // Poll git branch, dirty count, mode, and project
   useEffect(() => {
     const refresh = () => {
       api.gitGetBranch().then(setGitBranch);
       api.gitGetStatus().then(setGitDirtyCount);
+      api.getMode().then(setMode).catch(() => {});
+      api.getThreadProject().then(setProject).catch(() => {});
     };
     refresh();
     const interval = setInterval(refresh, 5000);
@@ -353,6 +364,45 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
     setShowThreadPicker((prev) => !prev);
   }, [api]);
 
+  const handleToggleMode = useCallback(() => {
+    const next = mode === 'local' ? 'remote' : 'local';
+    setMode(next);
+    api.setMode(next);
+  }, [api, mode]);
+
+  const handleOpenProjectForm = useCallback(() => {
+    setProjectFormName(api.threadName);
+    setProjectFormTemplate('default');
+    setProjectFormGitUrl('');
+    setProjectFormError(null);
+    setShowProjectForm(true);
+    api.listTemplates().then(setTemplates).catch(() => {
+      setTemplates([{ name: 'default' }, { name: 'web-app' }]);
+    });
+  }, [api]);
+
+  const handleCreateProject = useCallback(async () => {
+    if (!projectFormName.trim()) {
+      setProjectFormError('Project name is required');
+      return;
+    }
+    setProjectFormLoading(true);
+    setProjectFormError(null);
+    try {
+      const result = await api.createProject(
+        projectFormName.trim(),
+        projectFormTemplate,
+        projectFormGitUrl.trim() || null,
+      );
+      setProject(result);
+      setShowProjectForm(false);
+    } catch (err) {
+      setProjectFormError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setProjectFormLoading(false);
+    }
+  }, [api, projectFormName, projectFormTemplate, projectFormGitUrl]);
+
   const isEmpty = messages.length === 0 && !isStreaming && !isLoading;
 
   return (
@@ -378,7 +428,29 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
             <span className="chat-header__thread-name">{api.threadName}</span>
           )}
         </div>
+        {project ? (
+          <span className="chat-header__project-badge chat-header__project-badge--bound" title={`Project: ${project.name}\n${project.path}`}>
+            {project.name}
+          </span>
+        ) : (
+          <button
+            className="chat-header__project-badge chat-header__project-badge--none"
+            onClick={handleOpenProjectForm}
+            type="button"
+            title="No project bound — click to start one"
+          >
+            No Project
+          </button>
+        )}
         <div className="chat-header__actions">
+          <button
+            className={`chat-header__mode-badge chat-header__mode-badge--${mode}`}
+            onClick={handleToggleMode}
+            type="button"
+            title={`Mode: ${mode}. Click to switch to ${mode === 'local' ? 'remote' : 'local'}.`}
+          >
+            {mode === 'local' ? 'Local' : 'Remote'}
+          </button>
           <button
             className={`chat-header__btn${showVerbose ? ' chat-header__btn--active' : ''}`}
             onClick={handleToggleVerbose}
@@ -415,6 +487,64 @@ export default function ChatPanel({ api }: ChatPanelProps): React.ReactElement {
                 {t}
               </div>
             ))}
+          </div>
+        )}
+        {showProjectForm && (
+          <div className="chat-project-form">
+            <div className="chat-project-form__header">
+              <span className="chat-project-form__title">Start Project</span>
+              <button
+                className="chat-project-form__close"
+                onClick={() => setShowProjectForm(false)}
+                type="button"
+              >
+                &times;
+              </button>
+            </div>
+            <label className="chat-project-form__label">
+              Name
+              <input
+                className="chat-project-form__input"
+                type="text"
+                value={projectFormName}
+                onChange={(e) => setProjectFormName(e.target.value)}
+                placeholder="project-name"
+                autoFocus
+              />
+            </label>
+            <label className="chat-project-form__label">
+              Template
+              <select
+                className="chat-project-form__select"
+                value={projectFormTemplate}
+                onChange={(e) => setProjectFormTemplate(e.target.value)}
+              >
+                {templates.map((t) => (
+                  <option key={t.name} value={t.name}>{t.name}</option>
+                ))}
+              </select>
+            </label>
+            <label className="chat-project-form__label">
+              Git clone URL <span className="chat-project-form__optional">(optional)</span>
+              <input
+                className="chat-project-form__input"
+                type="text"
+                value={projectFormGitUrl}
+                onChange={(e) => setProjectFormGitUrl(e.target.value)}
+                placeholder="https://github.com/..."
+              />
+            </label>
+            {projectFormError && (
+              <div className="chat-project-form__error">{projectFormError}</div>
+            )}
+            <button
+              className="chat-project-form__submit"
+              onClick={handleCreateProject}
+              disabled={projectFormLoading}
+              type="button"
+            >
+              {projectFormLoading ? 'Creating...' : 'Create Project'}
+            </button>
           </div>
         )}
       </div>

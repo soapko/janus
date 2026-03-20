@@ -87,6 +87,16 @@
   - Orphaned process cleanup on app launch and quit
   - Cumulus 0.5.1 integration
 
+## 032 - Remote Gateway
+
+- [◒] 032e: Janus remote mode -> [032e-janus-remote-mode.md](docs/tasks/032e-janus-remote-mode.md)
+  - `sendMessageRemote()` with SSE stream parsing (token/segment/done/error)
+  - Gateway config at `~/.cumulus/gateway.json` (url, apiKey, enabled)
+  - Route selection: gateway.enabled → remote, else local
+  - Remote `getHistory()` and `listThreads()` via gateway API
+  - No local subprocess/pool/RAG when remote
+  - Explicit error on gateway unreachable (no silent fallback)
+
 ## 019 - UX Polish
 
 - [◒] 019: New tab default thread -> [019-new-tab-default-thread.md](docs/tasks/019-new-tab-default-thread.md)

@@ -654,9 +654,16 @@ function mountCumulusReact(tab, container, threadName) {
           }
         }
       },
+      // Mode (local/remote)
+      getMode: () => window.electronAPI.cumulusGetMode(threadName),
+      setMode: (mode) => window.electronAPI.cumulusSetMode(threadName, mode),
       // Git info
       gitGetBranch: () => cachedProjectPath ? window.electronAPI.gitGetBranch(cachedProjectPath) : Promise.resolve(null),
       gitGetStatus: () => cachedProjectPath ? window.electronAPI.gitGetStatus(cachedProjectPath) : Promise.resolve(0),
+      // Project management
+      getThreadProject: () => window.electronAPI.cumulusGetThreadProject(threadName),
+      listTemplates: () => window.electronAPI.cumulusListTemplates(threadName),
+      createProject: (name, template, gitCloneUrl) => window.electronAPI.cumulusCreateProject(threadName, name, template, gitCloneUrl),
       switchThread: (newThreadName) => {
         // Kill current subprocess
         window.electronAPI.cumulusKill(threadName);

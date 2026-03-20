@@ -33,6 +33,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   cumulusKill: (thread) => ipcRenderer.send('cumulus:kill', thread),
   cumulusGetHistory: (thread, count) => ipcRenderer.invoke('cumulus:get-history', thread, count),
   cumulusListThreads: () => ipcRenderer.invoke('cumulus:list-threads'),
+  cumulusGetMode: (thread) => ipcRenderer.invoke('cumulus:get-mode', thread),
+  cumulusSetMode: (thread, mode) => ipcRenderer.invoke('cumulus:set-mode', thread, mode),
+  cumulusGetThreadProject: (thread) => ipcRenderer.invoke('cumulus:get-thread-project', thread),
+  cumulusListTemplates: (thread) => ipcRenderer.invoke('cumulus:list-templates', thread),
+  cumulusCreateProject: (thread, name, template, gitCloneUrl) => ipcRenderer.invoke('cumulus:create-project', thread, name, template, gitCloneUrl),
   onCumulusMessage: (callback) => {
     const handler = (_, data) => callback(data);
     ipcRenderer.on('cumulus:message', handler);

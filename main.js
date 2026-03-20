@@ -262,6 +262,40 @@ ipcMain.handle('cumulus:list-threads', async (event) => {
   return bridge.listThreads();
 });
 
+// Get thread mode (local/remote)
+ipcMain.handle('cumulus:get-mode', async (event, threadName) => {
+  const bridge = getBridge(event);
+  if (!bridge) return 'local';
+  return bridge.getThreadMode(threadName);
+});
+
+// Set thread mode (local/remote)
+ipcMain.handle('cumulus:set-mode', async (event, threadName, mode) => {
+  const bridge = getBridge(event);
+  if (!bridge) return;
+  await bridge.setThreadMode(threadName, mode);
+});
+
+// ===== PROJECT IPC HANDLERS =====
+
+ipcMain.handle('cumulus:get-thread-project', async (event, threadName) => {
+  const bridge = getBridge(event);
+  if (!bridge) return null;
+  return bridge.getThreadProject(threadName);
+});
+
+ipcMain.handle('cumulus:list-templates', async (event, threadName) => {
+  const bridge = getBridge(event);
+  if (!bridge) return [{ name: 'default' }, { name: 'web-app' }];
+  return bridge.listTemplates(threadName);
+});
+
+ipcMain.handle('cumulus:create-project', async (event, threadName, projectName, template, gitCloneUrl) => {
+  const bridge = getBridge(event);
+  if (!bridge) throw new Error('No bridge');
+  return bridge.createProject(threadName, projectName, template, gitCloneUrl);
+});
+
 // ===== SLASH COMMAND IPC HANDLERS =====
 
 ipcMain.handle('cumulus:list-include-files', async (event, threadName) => {

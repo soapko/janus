@@ -47,6 +47,15 @@ export interface RevertResult {
   error?: string;
 }
 
+export interface ProjectInfo {
+  name: string;
+  path: string;
+}
+
+export interface ProjectTemplate {
+  name: string;
+}
+
 export interface CumulusChatAPI {
   sendMessage: (message: string, attachments?: Attachment[]) => void;
   kill: () => void;
@@ -68,7 +77,14 @@ export interface CumulusChatAPI {
   revert: (messageId: string, restoreGit: boolean) => Promise<RevertResult>;
   closeTab: () => void;
   switchThread: (newThreadName: string) => void;
+  // Mode (local/remote)
+  getMode: () => Promise<'local' | 'remote'>;
+  setMode: (mode: 'local' | 'remote') => Promise<void>;
   // Git info
   gitGetBranch: () => Promise<string | null>;
   gitGetStatus: () => Promise<number>;
+  // Project management
+  getThreadProject: () => Promise<ProjectInfo | null>;
+  listTemplates: () => Promise<ProjectTemplate[]>;
+  createProject: (name: string, template: string, gitCloneUrl?: string | null) => Promise<ProjectInfo>;
 }
