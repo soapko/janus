@@ -3,6 +3,10 @@
  *
  * Dynamically imports Cumulus ESM library into Janus's CJS main process.
  * Manages threads, spawns Claude subprocesses, and streams responses via IPC.
+ *
+ * As of cumulus v0.10.0, most pipeline helpers (prompt generation, stream parsing,
+ * MCP config, binary resolution) are imported from the library. Janus retains
+ * subprocess lifecycle management for pool gating, kill support, and message queuing.
  */
 
 const { spawn } = require('child_process');
@@ -13,120 +17,12 @@ const os = require('os');
 const CUMULUS_DIR = path.join(os.homedir(), '.cumulus');
 const THREADS_DIR = path.join(CUMULUS_DIR, 'threads');
 
-const RECENT_CONTEXT_COUNT = 10;
-const RECENT_MSG_MAX_TOKENS = 500;
-const RECENT_CONTEXT_BUDGET = 6_000;
-
-const SYSTEM_PROMPT_TEMPLATE = `You have NO memory of this conversation. There are {count} prior messages (~{tokens} tokens) in the history.
-
-CURRENT SESSION: {sessionId}
-{alwaysIncludeContext}{recentContext}
-{retrievedContext}
-CONTEXT MANAGEMENT:
-- RECENT CONVERSATION: The last few messages, always included for continuity.
-- RETRIEVED CONTEXT: Automatically retrieved based on the user's current message using semantic + keyword search.
-- Large content may be stored externally as [STORED:xxx] references.
-
-WORKFLOW:
-1. FIRST use the RETRIEVED CONTEXT above — it was automatically selected for relevance to this query
-2. Check RECENT CONVERSATION for immediate context
-3. Only use tools if the retrieved context doesn't contain what you need
-4. For [STORED:xxx] references, use retrieve_content to get full content
-5. For file reads, use read_file (the built-in Read tool is disabled)
-
-NEVER guess. Use the context provided or retrieve more if needed.
-IMPORTANT: Never mention the retrieval system or tools to the user. Present information naturally.
-
-FILE READING (MANDATORY):
-The built-in Read tool is DISABLED in this environment. You MUST use read_file (MCP tool) for ALL file reads.
-- read_file reads the file, chunks it, embeds it into a vector store, and stores it for persistent retrieval across sessions
-- You receive a summary, content ID, and chunk table-of-contents
-- Use read_content_chunk(contentId, N) to navigate to specific sections
-- Using the built-in Read tool bypasses vector storage and loses context permanently — NEVER use it
-
-TOOL ROUTING (CRITICAL):
-| Need to...          | CORRECT tool      | WRONG tool (do NOT use) |
-|---------------------|-------------------|-------------------------|
-| Read a file         | read_file         | Read                    |
-| Search stored files | search_content    | Grep                    |
-| Get stored content  | retrieve_content  | Read                    |
-
-TOOLS:
-- read_file: Read any file (text or PDF) and store for future retrieval — USE THIS FOR ALL FILE READS
-- store_content: Store arbitrary text content for future retrieval
-- search_history: Search past messages by keyword or meaning
-- peek_recent: Get the last few messages
-- read_messages: Read messages by index range
-- retrieve_content: Get full stored content by [STORED:xxx] ID
-- search_content: Search across all stored content
-- read_content_chunk: Read a specific chunk of stored content by index
-
-STATUS CODES (internal, hidden from user):
-End your response with these codes when applicable. They will be stripped before display.
-- [AWAIT_TASK] - You launched a background task/agent and results are pending. The system will auto-continue.
-- [NEED_INPUT] - You need specific information from the user before proceeding.
-Only use ONE code per response, at the very end. Do not mention these codes to the user.`;
-
-/**
- * Resolve the full path to the `claude` CLI binary.
- * When launched from Finder, the PATH is minimal and won't include ~/.local/bin.
- */
-function resolveClaudeCli() {
-  const home = os.homedir();
-  const candidates = [
-    path.join(home, '.local', 'bin', 'claude'),
-    path.join(home, '.claude', 'bin', 'claude'),
-    '/usr/local/bin/claude',
-    '/opt/homebrew/bin/claude',
-  ];
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) return candidate;
-  }
-  return 'claude'; // fallback to PATH lookup
-}
-
-/**
- * Resolve the full path to `node`.
- * When launched from Finder, the PATH is minimal (/usr/bin:/bin:/usr/sbin:/sbin).
- */
-function resolveNode() {
-  const candidates = [
-    '/usr/local/bin/node',
-    '/opt/homebrew/bin/node',
-    path.join(os.homedir(), '.nvm/versions/node', 'current', 'bin/node'),
-    '/usr/bin/node',
-  ];
-  // Also check NVM versions directory for any installed node
-  const nvmDir = path.join(os.homedir(), '.nvm/versions/node');
-  try {
-    const versions = fs.readdirSync(nvmDir).sort().reverse();
-    for (const v of versions) {
-      candidates.push(path.join(nvmDir, v, 'bin/node'));
-    }
-  } catch {
-    // No NVM installed
-  }
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) return candidate;
-  }
-  return 'node'; // fallback to PATH lookup
-}
-
 // Lazy-loaded Cumulus modules (ESM)
 let cumulus = null;
-let resolvedProxyPath = null;
-let resolvedMcpServerPath = null;
 
 async function loadCumulus() {
   if (cumulus) return cumulus;
   cumulus = await import('@luckydraw/cumulus');
-  // Cache resolved paths for generateMcpConfig (sync function needs these)
-  try {
-    resolvedProxyPath = cumulus.getProxyPath();
-    resolvedMcpServerPath = cumulus.getMcpServerPath();
-  } catch {
-    // Fallback to hardcoded paths in generateMcpConfig
-  }
   return cumulus;
 }
 
@@ -138,217 +34,6 @@ function ensureDirectories() {
 
 function getThreadPath(threadName) {
   return path.join(THREADS_DIR, `${threadName}.jsonl`);
-}
-
-function getContentStorePath(threadPath) {
-  return threadPath.replace(/\.jsonl$/, '.content');
-}
-
-function getSessionsPath(threadPath) {
-  return threadPath.replace(/\.jsonl$/, '.sessions');
-}
-
-function truncateToTokens(content, maxTokens, estimateTokensFn) {
-  const tokens = estimateTokensFn(content);
-  if (tokens <= maxTokens) return content;
-  const targetChars = maxTokens * 3;
-  return content.slice(0, targetChars) + '... [truncated]';
-}
-
-function formatRecentContext(recentMessages, budgetTokens, estimateTokensFn) {
-  if (recentMessages.length === 0 || budgetTokens <= 0) return '';
-
-  const header = '\nRECENT CONVERSATION (last few messages):\n---\n';
-  const footer = '---\n';
-  const overhead = estimateTokensFn(header + footer);
-  let remaining = budgetTokens - overhead;
-  if (remaining <= 0) return '';
-
-  const formatted = [];
-  for (let i = recentMessages.length - 1; i >= 0 && remaining > 0; i--) {
-    const msg = recentMessages[i];
-    const label = msg.role === 'user' ? 'User' : 'Assistant';
-    const truncated = truncateToTokens(msg.content, RECENT_MSG_MAX_TOKENS, estimateTokensFn);
-    const line = `[${label}]: ${truncated}\n`;
-    const lineTokens = estimateTokensFn(line);
-
-    if (lineTokens > remaining) break;
-
-    formatted.unshift(line);
-    remaining -= lineTokens;
-  }
-
-  if (formatted.length === 0) return '';
-  return header + formatted.join('') + footer;
-}
-
-function generateSystemPrompt(count, tokens, sessionId, recentMessages, retrievedContext, alwaysIncludeContext, estimateTokensFn) {
-  const recentContext = formatRecentContext(recentMessages, RECENT_CONTEXT_BUDGET, estimateTokensFn);
-  return SYSTEM_PROMPT_TEMPLATE
-    .replace('{count}', count.toString())
-    .replace('{tokens}', tokens.toString())
-    .replace('{sessionId}', sessionId)
-    .replace('{alwaysIncludeContext}', alwaysIncludeContext)
-    .replace('{recentContext}', recentContext)
-    .replace('{retrievedContext}', retrievedContext);
-}
-
-function generateMcpConfig(threadPath, sessionId, agentName, sharedMcpPort = null) {
-  const agentsMcpPath = path.resolve(__dirname, 'janus-agents-mcp.js');
-  const nodePath = resolveNode();
-
-  // Cumulus-history MCP: use lightweight proxy if shared server is running, else full server
-  let cumulusHistoryConfig;
-  if (sharedMcpPort) {
-    // Shared mode: tiny proxy (~5MB) that forwards JSON-RPC to shared HTTP server
-    const proxyPath = resolvedProxyPath || path.resolve(__dirname, 'node_modules/@luckydraw/cumulus/dist/mcp/proxy.js');
-    const threadName = path.basename(threadPath, '.jsonl');
-    cumulusHistoryConfig = {
-      command: nodePath,
-      args: [proxyPath],
-      env: {
-        CUMULUS_SHARED_URL: `http://127.0.0.1:${sharedMcpPort}`,
-        CUMULUS_THREAD_NAME: threadName,
-      },
-    };
-  } else {
-    // Fallback: full MCP server per agent (~50MB each)
-    const mcpServerPath = resolvedMcpServerPath || path.resolve(__dirname, 'node_modules/@luckydraw/cumulus/dist/mcp/index.js');
-    const contentStorePath = getContentStorePath(threadPath);
-    const sessionsPath = getSessionsPath(threadPath);
-    cumulusHistoryConfig = {
-      command: nodePath,
-      args: [mcpServerPath],
-      env: {
-        CUMULUS_THREAD_PATH: threadPath,
-        CUMULUS_CONTENT_PATH: contentStorePath,
-        CUMULUS_SESSIONS_PATH: sessionsPath,
-        ...(sessionId && { CUMULUS_SESSION_ID: sessionId }),
-      },
-    };
-  }
-
-  const config = {
-    mcpServers: {
-      'cumulus-history': cumulusHistoryConfig,
-      'janus-agents': {
-        command: nodePath,
-        args: [agentsMcpPath],
-        env: {
-          JANUS_API_URL: 'http://localhost:9223',
-          JANUS_AGENT_NAME: agentName || '',
-        },
-      },
-    },
-  };
-
-  const configPath = path.join(CUMULUS_DIR, `mcp-config-${Date.now()}.json`);
-  ensureDirectories();
-  fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
-  return configPath;
-}
-
-function cleanupMcpConfig(configPath) {
-  try {
-    if (configPath && fs.existsSync(configPath)) {
-      fs.unlinkSync(configPath);
-    }
-  } catch {
-    // Ignore cleanup errors
-  }
-}
-
-/**
- * Parse a stream-json line into typed StreamSegment objects.
- * Returns an array of segments (may be empty if the line isn't relevant).
- */
-function parseStreamSegments(line) {
-  if (!line.trim()) return [];
-  try {
-    const parsed = JSON.parse(line);
-
-    // Assistant message — may contain text, thinking, tool_use blocks
-    if (parsed.type === 'assistant' && parsed.message?.content) {
-      const segments = [];
-      for (const block of parsed.message.content) {
-        if (block.type === 'text' && block.text) {
-          segments.push({ type: 'text', content: block.text });
-        } else if (block.type === 'thinking' && block.thinking) {
-          segments.push({ type: 'thinking', content: block.thinking });
-        } else if (block.type === 'tool_use') {
-          segments.push({ type: 'tool_use', tool: block.name, input: block.input || {} });
-        } else if (block.type === 'tool_result') {
-          const content = typeof block.content === 'string' ? block.content : JSON.stringify(block.content);
-          segments.push({ type: 'tool_result', content, isError: !!block.is_error });
-        }
-      }
-      return segments;
-    }
-
-    // User message — contains tool_result blocks (Claude CLI stream-json format)
-    if (parsed.type === 'user' && parsed.message?.content) {
-      const segments = [];
-      for (const block of parsed.message.content) {
-        if (block.type === 'tool_result') {
-          const content = typeof block.content === 'string' ? block.content : JSON.stringify(block.content);
-          segments.push({ type: 'tool_result', content, isError: !!block.is_error });
-        }
-      }
-      return segments;
-    }
-
-    // Standalone tool_result event (type field)
-    if (parsed.type === 'tool_result') {
-      const content = typeof parsed.content === 'string'
-        ? parsed.content
-        : (parsed.content ? JSON.stringify(parsed.content) : '');
-      return [{ type: 'tool_result', content, isError: !!parsed.is_error }];
-    }
-
-    // Standalone tool_result event (output field, no type)
-    if (parsed.output !== undefined) {
-      return [{ type: 'tool_result', content: String(parsed.output), isError: false }];
-    }
-
-    // System event
-    if (parsed.type === 'system') {
-      const content = parsed.subtype
-        ? `${parsed.subtype}: ${parsed.message || ''}`
-        : (parsed.message || JSON.stringify(parsed));
-      return [{ type: 'system', content }];
-    }
-
-    // Result / completion event
-    if (parsed.type === 'result') {
-      return [{ type: 'result', duration_ms: parsed.duration_ms, usage: parsed.usage }];
-    }
-
-    return [];
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Extract text content from a stream-json line.
- */
-function extractTextFromStreamLine(line) {
-  if (!line.trim()) return null;
-  try {
-    const parsed = JSON.parse(line);
-    if (parsed.type === 'assistant' && parsed.message?.content) {
-      const texts = [];
-      for (const block of parsed.message.content) {
-        if (block.type === 'text' && block.text) {
-          texts.push(block.text);
-        }
-      }
-      return texts.length > 0 ? texts.join('\n\n') : null;
-    }
-    return null;
-  } catch {
-    return null;
-  }
 }
 
 /**
@@ -368,22 +53,6 @@ function mapMessageForRenderer(msg) {
   };
 }
 
-/**
- * Compute average relevance from the top-K retrieval scores.
- * Takes the top 10 scores across history + content results to avoid dilution.
- */
-function computeAvgRelevance(debug) {
-  if (!debug) return 0;
-  const allScores = [
-    ...(debug.historyResults || []).map(r => r.score),
-    ...(debug.contentResults || []).map(r => r.score),
-  ];
-  if (allScores.length === 0) return 0;
-  allScores.sort((a, b) => b - a);
-  const topK = allScores.slice(0, 10);
-  return topK.reduce((sum, s) => sum + s, 0) / topK.length;
-}
-
 class CumulusBridge {
   constructor(projectPath, windowId = null, pool = null, sharedMcpPort = null) {
     this.projectPath = projectPath;
@@ -391,7 +60,7 @@ class CumulusBridge {
     this.pool = pool;            // SubprocessPool (shared across bridges)
     this.sharedMcpPort = sharedMcpPort; // Shared cumulus-history MCP server port (null = use per-agent full server)
     this._destroyed = false;     // Safety flag for queued-then-destroyed
-    this.threads = new Map(); // threadName -> { history, content, session, mcpConfigPath }
+    this.threads = new Map(); // threadName -> { history, content, session, mcpConfigPath, threadPath, adaptive }
     this.activeProcesses = new Map(); // threadName -> ChildProcess
     this.messageQueues = new Map(); // threadName -> QueuedMessage[]
     this.debugContexts = new Map(); // threadName -> last debug context snapshot
@@ -408,21 +77,31 @@ class CumulusBridge {
     }
 
     const lib = await loadCumulus();
-    const threadPath = getThreadPath(threadName);
-    const contentStorePath = getContentStorePath(threadPath);
-    const sessionsPath = getSessionsPath(threadPath);
 
-    const history = new lib.HistoryStore(threadPath);
-    const content = new lib.ContentStore(contentStorePath);
-    const session = new lib.SessionManager(sessionsPath, threadName);
-    await session.initialize();
+    // Use cumulus's cached thread state (history, content, session, adaptive)
+    const threadState = await lib.getOrCreateThread(threadName);
 
-    const mcpConfigPath = generateMcpConfig(threadPath, session.getSessionId(), threadName, this.sharedMcpPort);
+    // Generate MCP config with janus-agents as extra server
+    const agentsMcpPath = path.resolve(__dirname, 'janus-agents-mcp.js');
+    const nodePath = lib.resolveNode();
+    const mcpConfigPath = lib.generateMcpConfig(
+      threadState.threadPath,
+      threadState.session.getSessionId(),
+      threadName,
+      this.sharedMcpPort,
+      {
+        'janus-agents': {
+          command: nodePath,
+          args: [agentsMcpPath],
+          env: {
+            JANUS_API_URL: 'http://localhost:9223',
+            JANUS_AGENT_NAME: threadName,
+          },
+        },
+      }
+    );
 
-    // Load adaptive context budget for this thread
-    const adaptive = await lib.loadAdaptiveState(threadPath);
-
-    const thread = { history, content, session, mcpConfigPath, threadPath, adaptive };
+    const thread = { ...threadState, mcpConfigPath };
     this.threads.set(threadName, thread);
     return thread;
   }
@@ -555,7 +234,7 @@ class CumulusBridge {
     const stats = await thread.history.getStats();
 
     // Get recent messages
-    const recentMessages = await thread.history.getRecent(RECENT_CONTEXT_COUNT);
+    const recentMessages = await thread.history.getRecent(lib.RECENT_CONTEXT_COUNT);
     const recentConversation = recentMessages
       .filter(m => m.role !== 'session')
       .map(m => ({ role: m.role, content: m.content }));
@@ -572,20 +251,20 @@ class CumulusBridge {
     // Calculate RAG budget using adaptive limit, with optional preset override
     const adaptiveBudget = thread.adaptive.getTotalContextBudget();
     const userQueryTokens = lib.estimateTokens(messageText);
-    const overhead = userQueryTokens + alwaysInclude.totalTokens + RECENT_CONTEXT_BUDGET;
+    const overhead = userQueryTokens + alwaysInclude.totalTokens + lib.RECENT_CONTEXT_BUDGET;
     const effectiveBudget = lib.resolveRagBudget
       ? lib.resolveRagBudget(mergedConfig, adaptiveBudget, overhead)
       : adaptiveBudget;
     const ragBudget = Math.max(
       0,
-      effectiveBudget - userQueryTokens - alwaysInclude.totalTokens - RECENT_CONTEXT_BUDGET
+      effectiveBudget - userQueryTokens - alwaysInclude.totalTokens - lib.RECENT_CONTEXT_BUDGET
     );
 
     // Run RAG retrieval
     let retrievalResult = null;
     try {
       const threadPath = getThreadPath(threadName);
-      const sessionsPath = getSessionsPath(threadPath);
+      const sessionsPath = threadPath.replace(/\.jsonl$/, '.sessions');
       const allMessages = await thread.history.getAll();
       const totalMessages = allMessages.length;
       retrievalResult = await lib.retrieve(messageText, thread.history, thread.content, {
@@ -613,7 +292,7 @@ class CumulusBridge {
         total: adaptiveBudget,
         userQuery: userQueryTokens,
         alwaysInclude: alwaysInclude.totalTokens,
-        recentContext: RECENT_CONTEXT_BUDGET,
+        recentContext: lib.RECENT_CONTEXT_BUDGET,
         ragAvailable: ragBudget,
         ragUsed: retrievalResult?.tokensUsed ?? 0,
       },
@@ -621,7 +300,7 @@ class CumulusBridge {
         historyCount: retrievalResult.historyCount ?? 0,
         contentCount: retrievalResult.contentCount ?? 0,
         tokensUsed: retrievalResult.tokensUsed ?? 0,
-        avgRelevance: computeAvgRelevance(retrievalResult.debug),
+        avgRelevance: lib.computeAvgRelevance(retrievalResult.debug),
         queryType: retrievalResult.debug?.queryType ?? 'unknown',
       } : null,
       alwaysInclude: {
@@ -637,15 +316,14 @@ class CumulusBridge {
       systemPromptLength: 0, // updated after generateSystemPrompt
     });
 
-    // Generate system prompt
-    const systemPrompt = generateSystemPrompt(
+    // Generate system prompt (using cumulus lib helpers)
+    const systemPrompt = lib.generateSystemPrompt(
       stats.count,
       stats.totalTokens,
       thread.session.getSessionId(),
       recentConversation,
       retrievedContext,
-      alwaysInclude.formattedContext,
-      lib.estimateTokens
+      alwaysInclude.formattedContext
     );
 
     // Update debug context with system prompt token estimate + breakdown
@@ -653,7 +331,7 @@ class CumulusBridge {
     if (debugCtx) {
       const systemPromptTokens = lib.estimateTokens(systemPrompt);
       const ragTokens = retrievalResult ? lib.estimateTokens(retrievedContext) : 0;
-      const recentContext = formatRecentContext(recentConversation, RECENT_CONTEXT_BUDGET, lib.estimateTokens);
+      const recentContext = lib.formatRecentContext(recentConversation, lib.RECENT_CONTEXT_BUDGET);
       const recentContextTokens = lib.estimateTokens(recentContext);
       const alwaysIncludeTokens = alwaysInclude.totalTokens;
       const instructionTokens = systemPromptTokens - ragTokens - alwaysIncludeTokens - recentContextTokens;
@@ -675,16 +353,7 @@ class CumulusBridge {
     });
 
     // Prepend system reminder for file reading tools
-    const FILE_READ_REMINDER = `<system-reminder>
-FILE READING: The built-in Read tool is DISABLED. Use read_file for ALL file reads (text, code, PDFs).
-- read_file reads the file, extracts text (including from PDFs), chunks it, embeds it, and stores it for future retrieval
-- You receive a summary, content ID, and chunk table-of-contents
-- Use the TOC to navigate: read_content_chunk("contentId", chunkIndex) for specific sections
-- Use search_content("query") to find content across all stored files
-</system-reminder>
-
-`;
-    messageForClaude = FILE_READ_REMINDER + messageForClaude;
+    messageForClaude = lib.FILE_READ_REMINDER + messageForClaude;
 
     // Spawn Claude
     const args = [
@@ -714,7 +383,7 @@ FILE READING: The built-in Read tool is DISABLED. Use read_file for ALL file rea
       cleanEnv.JANUS_WINDOW_ID = String(this.windowId);
     }
 
-    const claudePath = resolveClaudeCli();
+    const claudePath = lib.resolveClaudeCli();
     const claude = spawn(claudePath, args, {
       stdio: [hasImages ? 'pipe' : 'ignore', 'pipe', 'pipe'],
       env: cleanEnv,
@@ -757,7 +426,7 @@ FILE READING: The built-in Read tool is DISABLED. Use read_file for ALL file rea
       }
 
       // Existing text-only flow (backward compat)
-      const text = extractTextFromStreamLine(processed.line);
+      const text = lib.extractTextFromStreamLine(processed.line);
       if (text) {
         // Capture TTFT on first text output
         if (ttft === null) {
@@ -772,7 +441,7 @@ FILE READING: The built-in Read tool is DISABLED. Use read_file for ALL file rea
       }
 
       // Structured segments for verbose display
-      const segments = parseStreamSegments(processed.line);
+      const segments = lib.parseStreamSegments(processed.line);
       for (const seg of segments) {
         collectedSegments.push(seg);
         win.webContents.send('cumulus:stream-segment', { threadName, segment: seg });
@@ -792,9 +461,7 @@ FILE READING: The built-in Read tool is DISABLED. Use read_file for ALL file rea
     claude.stderr.on('data', (data) => {
       const text = data.toString();
       // Only treat ENOENT as a fatal error — everything else from stderr is
-      // verbose debug output from --verbose and should be ignored.  Previous
-      // patterns like /^Error:/m were too aggressive and matched non-fatal
-      // MCP warnings, causing the UI to clear the stream buffer mid-response.
+      // verbose debug output from --verbose and should be ignored.
       if (text.includes('ENOENT')) {
         win.webContents.send('cumulus:error', { threadName, error: text });
       }
@@ -844,7 +511,7 @@ FILE READING: The built-in Read tool is DISABLED. Use read_file for ALL file rea
               thread.adaptive.recordTurn({
                 ttft: ttft ?? (Date.now() - spawnTime), // fallback if no text was streamed
                 tokensUsed,
-                relevanceScore: computeAvgRelevance(retrievalResult?.debug),
+                relevanceScore: lib.computeAvgRelevance(retrievalResult?.debug),
               });
               await thread.adaptive.save();
               console.log(`[Bridge] Adaptive turn recorded: TTFT=${ttft}ms, tokens=${tokensUsed}, limit=${thread.adaptive.getContextLimit()}`);
@@ -1138,7 +805,11 @@ FILE READING: The built-in Read tool is DISABLED. Use read_file for ALL file rea
 
     // Clean up MCP configs
     for (const [, thread] of this.threads) {
-      cleanupMcpConfig(thread.mcpConfigPath);
+      try {
+        if (thread.mcpConfigPath && fs.existsSync(thread.mcpConfigPath)) {
+          fs.unlinkSync(thread.mcpConfigPath);
+        }
+      } catch { /* ignore */ }
     }
     this.threads.clear();
   }
